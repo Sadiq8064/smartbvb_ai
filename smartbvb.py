@@ -14,7 +14,13 @@ Important constraints per user request:
 - DO NOT store question/answer text anywhere (only metadata about stores/files is kept)
 - CORS enabled for testing: allows calls from anywhere
 """
-
+from PIL import Image
+import pandas as pd
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 import os
 import time
 import json
@@ -543,6 +549,8 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
         filename = clean_filename(original_filename)
         temp_path = temp_folder / filename
         size = 0
+
+        # Save uploaded file
         try:
             async with aiofiles.open(temp_path, "wb") as out_f:
                 while True:
@@ -552,71 +560,211 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
                     size += len(chunk)
                     if limit and size > MAX_FILE_BYTES:
                         await out_f.close()
-                        try:
-                            os.remove(temp_path)
-                        except Exception:
-                            pass
-                        results.append({"filename": filename, "uploaded": False, "indexed": False, "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes."})
+                        os.remove(temp_path)
+                        results.append({
+                            "filename": filename,
+                            "uploaded": False,
+                            "indexed": False,
+                            "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes."
+                        })
                         break
                     await out_f.write(chunk)
-            if results and results[-1].get("filename") == filename and results[-1].get("uploaded") is False:
+            if results and results[-1].get("uploaded") is False:
                 continue
         except Exception as e:
-            results.append({"filename": filename, "uploaded": False, "indexed": False, "reason": f"Failed to save local file: {e}"})
+            results.append({
+                "filename": filename,
+                "uploaded": False,
+                "indexed": False,
+                "reason": f"Failed to save local file: {e}"
+            })
             continue
 
+        # Detect file type
+        ext = filename.lower().split(".")[-1]
+
+        # ----------------------------------------------------------
+        # 1) IMAGE → COMPRESSED PDF
+        # ----------------------------------------------------------
+        if ext in ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff"]:
+            try:
+                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+                pdf_path = temp_folder / pdf_name
+
+                img = Image.open(temp_path).convert("RGB")
+                img.thumbnail((1500, 1500))  # reduce resolution
+
+                temp_img_jpg = str(temp_folder / "tmp_img.jpg")
+                img.save(temp_img_jpg, "JPEG", quality=70)
+
+                c = canvas.Canvas(str(pdf_path), pagesize=letter)
+                width, height = letter
+                iw, ih = img.size
+                scale = min(width / iw, height / ih)
+                iw *= scale
+                ih *= scale
+                c.drawImage(temp_img_jpg, 0, height - ih, width=iw, height=ih)
+                c.showPage()
+                c.save()
+
+                os.remove(temp_path)
+                temp_path = pdf_path
+                filename = pdf_name
+                size = os.path.getsize(temp_path)
+
+            except Exception as e:
+                results.append({
+                    "filename": filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"Image→PDF conversion failed: {e}"
+                })
+                continue
+
+        # ----------------------------------------------------------
+        # 2) EXCEL/CSV → PDF
+        # ----------------------------------------------------------
+        elif ext in ["xlsx", "xls", "csv"]:
+            try:
+                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+                pdf_path = temp_folder / pdf_name
+
+                if ext == "csv":
+                    df = pd.read_csv(temp_path)
+                else:
+                    df = pd.read_excel(temp_path)
+
+                doc = SimpleDocTemplate(str(pdf_path), pagesize=letter)
+                elements = []
+                table_data = [df.columns.tolist()] + df.values.tolist()
+
+                table = Table(table_data)
+                table.setStyle(TableStyle([
+                    ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+                    ("GRID", (0,0), (-1,-1), 0.25, colors.black),
+                    ("FONTSIZE", (0,0), (-1,-1), 7),
+                ]))
+
+                elements.append(table)
+                doc.build(elements)
+
+                os.remove(temp_path)
+                temp_path = pdf_path
+                filename = pdf_name
+                size = os.path.getsize(temp_path)
+
+            except Exception as e:
+                results.append({
+                    "filename": filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"Excel→PDF conversion failed: {e}"
+                })
+                continue
+
+        # ----------------------------------------------------------
+        # 3) OTHER NON-PDF FILES → PDF (generic text conversion)
+        # ----------------------------------------------------------
+        elif ext != "pdf":
+            try:
+                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+                pdf_path = temp_folder / pdf_name
+
+                content = open(temp_path, "r", errors="ignore").read()
+
+                doc = SimpleDocTemplate(str(pdf_path), pagesize=letter)
+                styles = getSampleStyleSheet()
+                elements = [Paragraph(content.replace("\n", "<br/>"), styles["Normal"])]
+                doc.build(elements)
+
+                os.remove(temp_path)
+                temp_path = pdf_path
+                filename = pdf_name
+                size = os.path.getsize(temp_path)
+
+            except Exception as e:
+                results.append({
+                    "filename": filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"Text→PDF conversion failed: {e}"
+                })
+                continue
+
+        # ----------------------------------------------------------
+        # UPLOAD TO GEMINI FILE SEARCH
+        # ----------------------------------------------------------
         document_resource = None
         document_id = None
         indexed_ok = False
         gemini_error = None
 
         try:
-            op = client.file_search_stores.upload_to_file_search_store(file=str(temp_path), file_search_store_name=fs_store_name, config={"display_name": filename})
+            op = client.file_search_stores.upload_to_file_search_store(
+                file=str(temp_path),
+                file_search_store_name=fs_store_name,
+                config={"display_name": filename}
+            )
             op = wait_for_operation(client, op)
+
             try:
                 document_resource = op.response.file_search_document.name
             except Exception:
                 document_resource = None
+
             if not document_resource:
                 docs = rest_list_documents_for_store(fs_store_name, sem_key)
                 for d in docs:
-                    display = d.get("displayName") or d.get("display_name") or ""
-                    name = d.get("name") or ""
-                    if display and display == filename:
-                        document_resource = name
+                    if d.get("displayName") == filename:
+                        document_resource = d.get("name")
                         break
-                if not document_resource:
-                    for d in docs:
-                        name = d.get("name") or ""
-                        if filename in name:
-                            document_resource = name
-                            break
+
             if document_resource:
                 document_id = document_resource.split("/")[-1]
                 indexed_ok = True
-            else:
-                indexed_ok = True
+
         except Exception as e:
             gemini_error = str(e)
-            indexed_ok = False
 
         try:
-            if temp_path.exists():
-                os.remove(temp_path)
+            os.remove(temp_path)
         except Exception:
             pass
 
-        entry = {"display_name": filename, "size_bytes": size, "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"), "gemini_indexed": indexed_ok, "document_resource": document_resource, "document_id": document_id, "gemini_error": gemini_error}
+        entry = {
+            "display_name": filename,
+            "size_bytes": size,
+            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "gemini_indexed": indexed_ok,
+            "document_resource": document_resource,
+            "document_id": document_id,
+            "gemini_error": gemini_error
+        }
+
         store_meta.setdefault("files", []).append(entry)
-        store_meta["total_size_bytes"] = store_meta.get("total_size_bytes", 0) + size
-        data["departments"][department]["sems"][sem]["total_size_bytes"] = data["departments"][department]["sems"][sem].get("total_size_bytes", 0) + size
+        store_meta["total_size_bytes"] += size
+        data["departments"][department]["sems"][sem]["total_size_bytes"] += size
         save_data(data)
 
-        results.append({"filename": filename, "uploaded": True, "indexed": indexed_ok, "document_resource": document_resource, "document_id": document_id, "gemini_error": gemini_error, "size_bytes": size})
+        results.append({
+            "filename": filename,
+            "uploaded": True,
+            "indexed": indexed_ok,
+            "document_resource": document_resource,
+            "document_id": document_id,
+            "gemini_error": gemini_error,
+            "size_bytes": size
+        })
 
-    store_total_bytes = data["file_stores"][store_name].get("total_size_bytes", 0)
+    store_total_bytes = store_meta.get("total_size_bytes", 0)
     sem_total_bytes = data["departments"][department]["sems"][sem].get("total_size_bytes", 0)
-    return {"success": True, "results": results, "store_total_bytes": store_total_bytes, "sem_total_bytes": sem_total_bytes}
+
+    return {
+        "success": True,
+        "results": results,
+        "store_total_bytes": store_total_bytes,
+        "sem_total_bytes": sem_total_bytes
+    }
 
 @app.get("/departments/{department}/sems/{sem}/stores/{store_name}/files")
 def list_files_in_store(department: str, sem: str, store_name: str):
