@@ -333,19 +333,44 @@ def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str =
 
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
+
     sems = data["departments"][department].setdefault("sems", {})
     if sem_name in sems:
         return JSONResponse({"error": "Sem already exists in the department"}, status_code=400)
 
-    # validate gemini api key by init
+    # -----------------------------------------
+    # validate GEMINI API KEY using real call
+    # -----------------------------------------
     try:
-        _ = init_gemini_client(gemini_api_key)
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid Gemini API key: {e}"}, status_code=400)
+        client = init_gemini_client(gemini_api_key)
 
-    sems[sem_name] = {"gemini_api_key": gemini_api_key, "stores": [], "total_size_bytes": 0}
+        # real verification call to Gemini
+        client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents="ping"
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Invalid Gemini API key: {e}"},
+            status_code=400
+        )
+
+    # if key valid → create sem
+    sems[sem_name] = {
+        "gemini_api_key": gemini_api_key,
+        "stores": [],
+        "total_size_bytes": 0
+    }
+
     save_data(data)
-    return {"success": True, "department": department, "sem": sem_name}
+
+    return {
+        "success": True,
+        "department": department,
+        "sem": sem_name
+    }
+
 
 @app.get("/admin/departments/{department}/sems")
 def list_sems(department: str):
@@ -353,7 +378,12 @@ def list_sems(department: str):
 
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
-    return {"success": True, "sems": list(data["departments"][department].get("sems", {}).keys())}
+
+    return {
+        "success": True,
+        "sems": list(data["departments"][department].get("sems", {}).keys())
+    }
+
 
 @app.delete("/admin/departments/{department}/sems/{sem}")
 def delete_sem(department: str, sem: str):
