@@ -13,13 +13,6 @@ Important constraints per user request:
 - NO session management
 - DO NOT store question/answer text anywhere (only metadata about stores/files is kept)
 - CORS enabled for testing: allows calls from anywhere
-
-Defensive behavior: If `ssl` / network dependencies or `google-genai` SDK are missing,
-API will still import and most endpoints will return clear errors when trying to call Gemini.
-This allows local unit tests of non-network logic.
-
-NOTE: For production use, run inside an image that has OpenSSL (libssl) installed and
-install required Python packages: fastapi, uvicorn, aiofiles, google-genai, requests, pydantic, python-multipart
 """
 
 import os
@@ -28,7 +21,6 @@ import json
 import shutil
 import re
 import requests
-import secrets
 import asyncio
 import logging
 from typing import List, Optional, Dict, Any
@@ -39,13 +31,12 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------------- Defensive imports ----------------
 try:
-    from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+    from fastapi import FastAPI, UploadFile, File, Form, HTTPException
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import aiofiles
     FASTAPI_AVAILABLE = True
 except Exception as e:
-    # fallback stubs for environments missing ssl / fastapi dependencies
     logger.warning("FastAPI or aiofiles import failed: %s. Running in limited mode.", e)
     FASTAPI_AVAILABLE = False
 
@@ -72,28 +63,6 @@ except Exception as e:
 
     def Form(*args, **kwargs):
         return None
-
-    def Header(*args, **kwargs):
-        return None
-
-    class FastAPI:
-        def __init__(self, *args, **kwargs):
-            self._routes = []
-
-        def _decorator(self, *dargs, **dkwargs):
-            def _wrap(func):
-                self._routes.append({"args": dargs, "kwargs": dkwargs, "func_name": func.__name__})
-                return func
-            return _wrap
-
-        def get(self, *args, **kwargs):
-            return self._decorator(*args, **kwargs)
-
-        def post(self, *args, **kwargs):
-            return self._decorator(*args, **kwargs)
-
-        def delete(self, *args, **kwargs):
-            return self._decorator(*args, **kwargs)
 
     class aiofiles:
         class open:
@@ -122,14 +91,16 @@ except Exception:
     types = None
 
 # ---------------- CONFIG ----------------
+# Path for persistent JSON metadata file (can be overridden with env var)
 DATA_FILE = os.getenv("DATA_FILE", "/data/gemini_stores.json")
 UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "/data/uploads"))
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", 50 * 1024 * 1024))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2))
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# Simple admin creds for local/dev testing (not secure for production)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "mrsadiq471@gmail.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sadiq^8064")
-ADMIN_TOKEN_TTL = int(os.getenv("ADMIN_TOKEN_TTL", 60 * 60 * 4))
 
 # ----------------------------------------
 app = FastAPI()
@@ -144,7 +115,6 @@ try:
         allow_headers=["*"],
     )
 except Exception:
-    # If cors middleware unavailable in stubbed environment, ignore
     pass
 
 # ---------------- Helpers: persistence ----------------
@@ -155,30 +125,85 @@ def ensure_dirs():
     except Exception as e:
         logger.debug("Could not create upload root: %s", e)
 
-
 def _ensure_data_file_initial():
+    """
+    Ensure a usable DATA_FILE exists. If DATA_FILE points to an existing directory,
+    we will write a gemini_stores.json file inside that directory and adjust DATA_FILE.
+    Returns the path used for the data file (may update global DATA_FILE).
+    """
+    global DATA_FILE
     base = {
         "file_stores": {},
-        "departments": {},
-        "admin_tokens": {}
+        "departments": {}
     }
-    if not os.path.exists(DATA_FILE):
-        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        with open(DATA_FILE, "w") as f:
-            json.dump(base, f, indent=2)
 
+    # If DATA_FILE is a directory, recover by using DATA_FILE/gemini_stores.json
+    if os.path.isdir(DATA_FILE):
+        logger.warning("DATA_FILE path %s is a directory. Using %s/gemini_stores.json instead.", DATA_FILE, DATA_FILE)
+        alt = os.path.join(DATA_FILE, "gemini_stores.json")
+        try:
+            os.makedirs(DATA_FILE, exist_ok=True)
+            if not os.path.exists(alt):
+                with open(alt, "w") as f:
+                    json.dump(base, f, indent=2)
+            DATA_FILE = alt
+            return DATA_FILE
+        except Exception as e:
+            logger.error("Failed to initialize alternative data file %s: %s", alt, e)
+            raise
+
+    # Ensure parent directory exists
+    parent = os.path.dirname(DATA_FILE) or "/"
+    try:
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+    except Exception as e:
+        logger.error("Could not create parent directory for DATA_FILE (%s): %s", parent, e)
+        raise
+
+    # If path somehow became a directory, error (can't proceed)
+    if os.path.isdir(DATA_FILE):
+        raise RuntimeError(f"DATA_FILE path {DATA_FILE} is a directory and cannot be used as a file.")
+
+    # Create the file if missing
+    if not os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "w") as f:
+                json.dump(base, f, indent=2)
+        except Exception as e:
+            logger.error("Failed to create DATA_FILE %s: %s", DATA_FILE, e)
+            raise
+
+    return DATA_FILE
 
 def load_data() -> Dict[str, Any]:
+    """
+    Load JSON metadata from DATA_FILE. If file is missing/corrupt, attempt to reinitialize.
+    """
+    # If DATA_FILE is a directory, try to recover by creating a file inside it
+    if os.path.isdir(DATA_FILE):
+        _ensure_data_file_initial()
+
     if not os.path.exists(DATA_FILE):
         _ensure_data_file_initial()
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
 
+    if not os.path.isfile(DATA_FILE):
+        raise RuntimeError(f"Data file path is not a regular file: {DATA_FILE}")
+
+    with open(DATA_FILE, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("DATA_FILE %s corrupted or empty. Reinitializing.", DATA_FILE)
+            _ensure_data_file_initial()
+            with open(DATA_FILE, "r") as f2:
+                return json.load(f2)
 
 def save_data(data: Dict[str, Any]):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+# Run initial ensures
 ensure_dirs()
 _ensure_data_file_initial()
 
@@ -199,34 +224,6 @@ def clean_filename(name: str, max_len: int = 180) -> str:
         return "file"
     return name
 
-
-def _generate_admin_token():
-    return secrets.token_hex(24)
-
-
-def _is_admin_token_valid(data: Dict[str, Any], token: str) -> bool:
-    if not token:
-        return False
-    toks = data.get("admin_tokens", {})
-    entry = toks.get(token)
-    if not entry:
-        return False
-    if entry.get("expires_at", 0) < time.time():
-        try:
-            del toks[token]
-            save_data(data)
-        except Exception:
-            pass
-        return False
-    return True
-
-
-def require_admin(token: Optional[str]):
-    data = load_data()
-    if not token or not _is_admin_token_valid(data, token):
-        raise HTTPException(status_code=401, detail="Invalid or missing admin token")
-    return True
-
 # ---------------- Gemini helpers ----------------
 
 def init_gemini_client(api_key: str):
@@ -236,7 +233,6 @@ def init_gemini_client(api_key: str):
         return genai.Client(api_key=api_key)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Gemini client: {e}")
-
 
 def wait_for_operation(client, operation):
     op = operation
@@ -251,7 +247,6 @@ def wait_for_operation(client, operation):
     if getattr(op, "error", None):
         raise RuntimeError(f"Operation failed: {op.error}")
     return op
-
 
 def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     url = f"{GEMINI_REST_BASE}/{file_search_store_name}/documents"
@@ -268,22 +263,19 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
 
 @app.post("/admin/login")
 def admin_login(email: str = Form(...), password: str = Form(...)):
+    """
+    Simple admin login for development use. Returns a success message.
+    (No session/token management — removed per request.)
+    """
     if email != ADMIN_EMAIL or password != ADMIN_PASSWORD:
         return JSONResponse({"error": "Invalid credentials"}, status_code=401)
 
-    data = load_data()
-    token = _generate_admin_token()
-    now = time.time()
-    data.setdefault("admin_tokens", {})
-    data["admin_tokens"][token] = {"created_at": now, "expires_at": now + ADMIN_TOKEN_TTL}
-    save_data(data)
-    return {"success": True, "admin_token": token, "expires_in_seconds": ADMIN_TOKEN_TTL}
-
+    return {"success": True, "message": "Admin authenticated"}
 
 @app.post("/admin/departments/create")
-def create_department(department_name: str = Form(...), x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def create_department(department_name: str = Form(...)):
     data = load_data()
-    require_admin(x_admin_token)
+
     if not department_name:
         raise HTTPException(status_code=400, detail="department_name required")
     departments = data.setdefault("departments", {})
@@ -293,18 +285,14 @@ def create_department(department_name: str = Form(...), x_admin_token: Optional[
     save_data(data)
     return {"success": True, "department": department_name}
 
-
 @app.get("/admin/departments")
-def list_departments(x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def list_departments():
     data = load_data()
-    require_admin(x_admin_token)
     return {"success": True, "departments": list(data.get("departments", {}).keys())}
 
-
 @app.delete("/admin/departments/{department}")
-def delete_department(department: str, x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def delete_department(department: str):
     data = load_data()
-    require_admin(x_admin_token)
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
 
@@ -339,11 +327,10 @@ def delete_department(department: str, x_admin_token: Optional[str] = Header(Non
     save_data(data)
     return {"success": True, "deleted_department": department}
 
-
 @app.post("/admin/departments/{department}/sems/create")
-def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str = Form(...), x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str = Form(...)):
     data = load_data()
-    require_admin(x_admin_token)
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     sems = data["departments"][department].setdefault("sems", {})
@@ -360,20 +347,18 @@ def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str =
     save_data(data)
     return {"success": True, "department": department, "sem": sem_name}
 
-
 @app.get("/admin/departments/{department}/sems")
-def list_sems(department: str, x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def list_sems(department: str):
     data = load_data()
-    require_admin(x_admin_token)
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     return {"success": True, "sems": list(data["departments"][department].get("sems", {}).keys())}
 
-
 @app.delete("/admin/departments/{department}/sems/{sem}")
-def delete_sem(department: str, sem: str, x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def delete_sem(department: str, sem: str):
     data = load_data()
-    require_admin(x_admin_token)
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     if sem not in data["departments"][department].get("sems", {}):
@@ -408,11 +393,10 @@ def delete_sem(department: str, sem: str, x_admin_token: Optional[str] = Header(
     save_data(data)
     return {"success": True, "deleted_sem": sem}
 
-
 @app.post("/admin/departments/{department}/sems/{sem}/stores/create")
-def create_store_in_sem(department: str, sem: str, store_name: str = Form(...), x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def create_store_in_sem(department: str, sem: str, store_name: str = Form(...)):
     data = load_data()
-    require_admin(x_admin_token)
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     if sem not in data["departments"][department].get("sems", {}):
@@ -443,7 +427,6 @@ def create_store_in_sem(department: str, sem: str, store_name: str = Form(...), 
     save_data(data)
     return {"success": True, "store_name": store_name, "file_search_store_resource": fs_store_name, "created_at": created_at}
 
-
 @app.get("/departments/{department}/sems/{sem}/stores")
 def list_stores_in_sem(department: str, sem: str):
     data = load_data()
@@ -455,7 +438,6 @@ def list_stores_in_sem(department: str, sem: str):
     file_stores = data.get("file_stores", {})
     result = [file_stores.get(s) for s in stores if s in file_stores]
     return {"success": True, "stores": result}
-
 
 @app.delete("/departments/{department}/sems/{sem}/stores/{store_name}")
 def delete_store_scoped(department: str, sem: str, store_name: str):
@@ -480,12 +462,10 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
     except Exception:
         pass
 
-    # subtract size from sem total
     removed_size = meta.get("total_size_bytes", 0)
     sem_meta = data["departments"][department]["sems"][sem]
     sem_meta["total_size_bytes"] = max(0, sem_meta.get("total_size_bytes", 0) - removed_size)
 
-    # delete local folder
     folder = UPLOAD_ROOT / department / sem / store_name
     if folder.exists():
         try:
@@ -493,7 +473,6 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
         except Exception:
             pass
 
-    # remove store
     try:
         sem_meta["stores"].remove(store_name)
     except Exception:
@@ -501,7 +480,6 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
     del data["file_stores"][store_name]
     save_data(data)
     return {"success": True, "deleted_store": store_name, "removed_size_bytes": removed_size}
-
 
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(department: str, sem: str, store_name: str, limit: Optional[bool] = Form(True), files: List[UploadFile] = File(...)):
@@ -610,7 +588,6 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
     sem_total_bytes = data["departments"][department]["sems"][sem].get("total_size_bytes", 0)
     return {"success": True, "results": results, "store_total_bytes": store_total_bytes, "sem_total_bytes": sem_total_bytes}
 
-
 @app.get("/departments/{department}/sems/{sem}/stores/{store_name}/files")
 def list_files_in_store(department: str, sem: str, store_name: str):
     data = load_data()
@@ -623,7 +600,6 @@ def list_files_in_store(department: str, sem: str, store_name: str):
     if store_name not in data.get("file_stores", {}):
         raise HTTPException(status_code=404, detail="Store metadata missing")
     return {"success": True, "files": data["file_stores"][store_name].get("files", [])}
-
 
 @app.delete("/departments/{department}/sems/{sem}/stores/{store_name}/documents/{document_id}")
 def delete_document_scoped(department: str, sem: str, store_name: str, document_id: str):
@@ -665,7 +641,6 @@ def delete_document_scoped(department: str, sem: str, store_name: str, document_
     save_data(data)
     return {"success": True, "deleted_document_id": document_id, "removed_size_bytes": removed_size}
 
-
 @app.get("/departments/{department}/sems/{sem}/usage")
 def sem_usage(department: str, sem: str):
     data = load_data()
@@ -683,11 +658,10 @@ def sem_usage(department: str, sem: str):
     sem_total = f"{round(sem_meta.get('total_size_bytes', 0) / (1024*1024), 2)} MB"
     return {"success": True, "store_sizes": store_sizes, "sem_total": sem_total}
 
-
 @app.get("/admin/departments/{department}/usage")
-def department_usage(department: str, x_admin_token: Optional[str] = Header(None, convert_underscores=False)):
+def department_usage(department: str):
     data = load_data()
-    require_admin(x_admin_token)
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     sems = data["departments"][department].get("sems", {})
@@ -698,7 +672,6 @@ def department_usage(department: str, x_admin_token: Optional[str] = Header(None
         sems_sizes[sem_name] = f"{round(b / (1024*1024), 2)} MB"
         total += b
     return {"success": True, "department_total": f"{round(total / (1024*1024), 2)} MB", "sems": sems_sizes}
-
 
 # ---------------- Gemini extraction / selection / RAG helpers ----------------
 
@@ -721,7 +694,6 @@ def _extract_system_and_query_sync(client, raw_text: str) -> str:
         txt = getattr(c, "text", None) or getattr(c, "content", None)
     return txt or ""
 
-
 def _parse_json_loose(raw: str) -> Dict:
     raw = (raw or "").strip()
     if not raw:
@@ -737,7 +709,6 @@ def _parse_json_loose(raw: str) -> Dict:
             except Exception:
                 return {"system_prompt": "", "user_query": raw}
         return {"system_prompt": "", "user_query": raw}
-
 
 def _call_gemini_store_selector_sync(client, stores: List[str], question: str) -> str:
     model = "gemini-2.5-flash"
@@ -764,7 +735,6 @@ If nothing matches, return stores: [] and put original question into unanswered.
         txt = getattr(c, "text", None) or getattr(c, "content", None)
     return txt or ""
 
-
 async def _call_gemini_for_store_selection(stores: List[str], question: str, sem_key: str) -> Dict:
     if not stores:
         return {"stores": [], "split_questions": {}, "unanswered": []}
@@ -780,7 +750,6 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str, sem
         return {"stores": parsed.get("stores", []) or [], "split_questions": parsed.get("split_questions", {}) or {}, "unanswered": parsed.get("unanswered", []) or []}
     except Exception:
         return {"stores": stores, "split_questions": {}, "unanswered": []}
-
 
 async def _call_rag_for_store(sem_key: str, store: str, question: str, system_prompt: Optional[str] = None) -> Dict:
     if genai is None:
@@ -808,11 +777,9 @@ async def _call_rag_for_store(sem_key: str, store: str, question: str, system_pr
             return {"store": store, "question": question, "answer": "", "error": str(e)}
     return await loop.run_in_executor(None, _sync_call)
 
-
 def data_store_name_for(local_store_name: str) -> str:
     d = load_data()
     return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
-
 
 def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers: List[Dict]) -> str:
     if not final_answers:
@@ -848,14 +815,12 @@ def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers:
             parts.append(f"{fa.get('store')}: {fa.get('answer')}")
         return "\n\n".join(parts)
 
-
 # =====================================================
 # ASK endpoint implementation (no session, no storing Q/A)
 # =====================================================
 
 @app.post("/departments/{department}/sems/{sem}/ask")
 async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
-    # payload expected: { "question": "..." }
     question = payload.get("question") if isinstance(payload, dict) else None
     if not question:
         raise HTTPException(status_code=400, detail="question required in request body")
@@ -959,15 +924,21 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         if extra_lines:
             merged_text += "\n\nThe following parts of your question could not be answered by any available service department:\n" + "\n".join(extra_lines)
 
-    # Return final response (NO session, NO storing of question/answers)
     return {"success": True, "response": merged_text, "stores_used": selected_stores, "sources": all_sources[:1], "unanswered_parts": unanswered_parts}
-
 
 # ---------------- Misc endpoints ----------------
 @app.get("/health")
 def health_check():
     return {"success": True, "status": "ok"}
 
+# ---------------- Startup quick writable-check ----------------
+try:
+    test_path = UPLOAD_ROOT / ".write_test"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("ok")
+    test_path.unlink()
+except Exception as e:
+    logger.error("Upload root not writable or cannot create test file: %s (UPLOAD_ROOT=%s)", e, UPLOAD_ROOT)
 
 # ---------------- Run guidance ----------------
 if __name__ == "__main__":
