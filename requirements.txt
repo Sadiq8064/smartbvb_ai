@@ -5,3 +5,7 @@ google-genai
 requests
 pydantic
 python-multipart
+Pillow
+pandas
+openpyxl
+reportlab
