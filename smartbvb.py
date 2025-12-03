@@ -1,4 +1,4 @@
-# smartbvb.py
+]# smartbvb.py
 """
 FastAPI backend (smartbvb) — clean production/testing-ready single-file API.
 
@@ -32,6 +32,7 @@ import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import mimetypes  # << FIX 2 helper (MIME detection)
 
 logger = logging.getLogger("smartbvb")
 logging.basicConfig(level=logging.INFO)
@@ -241,6 +242,18 @@ def clean_filename(name: str, max_len: int = 180) -> str:
     if not name:
         return "file"
     return name
+
+
+def guess_mime_type(filename: str, fallback: str = "application/octet-stream") -> str:
+    """
+    FIX 2 helper: robust MIME type detection.
+    - Try Python's mimetypes
+    - Fallback to generic octet-stream (Gemini will still try for many)
+    """
+    mime, _ = mimetypes.guess_type(filename)
+    if mime:
+        return mime
+    return fallback
 
 # ---------------- Gemini helpers ----------------
 
@@ -551,7 +564,7 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
     }
 
 
-# ---------------- UPDATED: upload files AS-IS (no PDF conversion) ----------------
+# ---------------- UPDATED: upload files AS-IS with correct MIME ----------------
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(
     department: str,
@@ -561,13 +574,12 @@ async def upload_files_scoped(
     files: List[UploadFile] = File(...)
 ):
     """
-    Upload files to a Gemini File Search store.
-
-    CHANGES from previous version:
-    - NO conversion to PDF.
-    - Whatever file the user uploads (docx, xlsx, png, txt, pdf, etc.) is sent
-      directly to Gemini File Search using upload_to_file_search_store.
-    - We still enforce MAX_FILE_BYTES and keep metadata the same.
+    FINAL FIXED VERSION:
+    - Saves uploaded file in ONE READ (no chunk corruption)
+    - Seeks to start before reading (safety)
+    - Provides correct MIME type to Gemini (content_type + mimetypes)
+    - No PDF conversion
+    - Supports all file types allowed by Gemini File Search
     """
     data = load_data()
 
@@ -600,31 +612,24 @@ async def upload_files_scoped(
         original_filename = upload.filename or "file"
         filename = clean_filename(original_filename)
         temp_path = temp_folder / filename
-        size = 0
 
-        # Save uploaded file to disk (as-is, no conversion)
+        # ---- FIX 1: ensure pointer at start, then READ ONCE ----
         try:
-            async with aiofiles.open(temp_path, "wb") as out_f:
-                while True:
-                    chunk = await upload.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if limit and size > MAX_FILE_BYTES:
-                        await out_f.close()
-                        os.remove(temp_path)
-                        results.append({
-                            "filename": filename,
-                            "uploaded": False,
-                            "indexed": False,
-                            "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes."
-                        })
-                        break
-                    await out_f.write(chunk)
+            await upload.seek(0)
+            content = await upload.read()
+            size = len(content)
 
-            # If previous step marked as not uploaded, skip indexing
-            if results and results[-1].get("uploaded") is False:
+            if limit and size > MAX_FILE_BYTES:
+                results.append({
+                    "filename": filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes."
+                })
                 continue
+
+            with open(temp_path, "wb") as f:
+                f.write(content)
 
         except Exception as e:
             results.append({
@@ -635,33 +640,38 @@ async def upload_files_scoped(
             })
             continue
 
-        # Make sure we have final size
-        if size == 0 and temp_path.exists():
-            size = os.path.getsize(temp_path)
-
         # ---------------------------
-        # Upload AS-IS to Gemini File Search
+        # Upload AS-IS to Gemini File Search WITH MIME TYPE
         # ---------------------------
         document_resource = None
         document_id = None
         indexed_ok = False
         gemini_error = None
 
+        # FIX 2: robust MIME
+        mime = upload.content_type or ""
+        if not mime or mime == "application/octet-stream":
+            mime = guess_mime_type(filename)
+
         try:
             op = client.file_search_stores.upload_to_file_search_store(
                 file=str(temp_path),
                 file_search_store_name=fs_store_name,
-                config={"display_name": filename}
+                config={
+                    "display_name": filename,
+                    "mime_type": mime
+                }
             )
+
             op = wait_for_operation(client, op)
 
-            # Try to get document resource name
+            # Try to extract document resource
             try:
                 document_resource = op.response.file_search_document.name
             except Exception:
                 document_resource = None
 
-            # Fallback: list documents and match by displayName
+            # Fallback: list documents
             if not document_resource:
                 docs = rest_list_documents_for_store(fs_store_name, sem_key)
                 for d in docs:
@@ -676,7 +686,7 @@ async def upload_files_scoped(
         except Exception as e:
             gemini_error = str(e)
 
-        # Remove local temp file (we only keep metadata)
+        # Delete temp file after upload
         try:
             os.remove(temp_path)
         except Exception:
