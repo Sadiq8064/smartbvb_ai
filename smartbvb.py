@@ -14,8 +14,8 @@ Important constraints per user request:
 - DO NOT store question/answer text anywhere (only metadata about stores/files is kept)
 - CORS enabled for testing: allows calls from anywhere
 """
-from PIL import Image
-import pandas as pd
+from PIL import Image  # kept from previous version (not used now, but left as-is)
+import pandas as pd    # kept from previous version
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
@@ -64,7 +64,6 @@ except Exception as e:
     def UploadFile(*args, **kwargs):
         class _UF:
             pass
-
         return _UF
 
     def File(*args, **kwargs):
@@ -90,7 +89,6 @@ except Exception as e:
                         self._f.close()
                 except Exception:
                     pass
-
 
 # Try to import google-genai SDK; if missing, set to None and endpoints will return clear error
 try:
@@ -131,8 +129,9 @@ try:
 except Exception:
     pass
 
-
 # ---------------- Helpers: persistence ----------------
+
+
 def ensure_dirs():
     try:
         UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
@@ -226,6 +225,8 @@ ensure_dirs()
 _ensure_data_file_initial()
 
 # ---------------- Utilities ----------------
+
+
 def clean_filename(name: str, max_len: int = 180) -> str:
     if not name:
         return "file"
@@ -241,8 +242,9 @@ def clean_filename(name: str, max_len: int = 180) -> str:
         return "file"
     return name
 
-
 # ---------------- Gemini helpers ----------------
+
+
 def init_gemini_client(api_key: str):
     if genai is None:
         raise RuntimeError("google-genai SDK is not installed on the server.")
@@ -278,8 +280,9 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     except Exception:
         return []
 
-
 # ---------------- Admin endpoints ----------------
+
+
 @app.post("/admin/login")
 def admin_login(email: str = Form(...), password: str = Form(...)):
     """
@@ -361,18 +364,13 @@ def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str =
     if sem_name in sems:
         return JSONResponse({"error": "Sem already exists in the department"}, status_code=400)
 
-    # -----------------------------------------
     # validate GEMINI API KEY using real call
-    # -----------------------------------------
     try:
         client = init_gemini_client(gemini_api_key)
-
-        # real verification call to Gemini
         client.models.generate_content(
             model="gemini-2.5-flash",
             contents="ping"
         )
-
     except Exception as e:
         return JSONResponse(
             {"error": f"Invalid Gemini API key: {e}"},
@@ -499,7 +497,7 @@ def list_stores_in_sem(department: str, sem: str):
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     if sem not in data["departments"][department].get("sems", {}):
-        raise HTTPException(status_code=404, detail="Sem not found")
+        raise HTTPException(statuscode=404, detail="Sem not found")
     stores = data["departments"][department]["sems"][sem].get("stores", [])
     file_stores = data.get("file_stores", {})
     result = [file_stores.get(s) for s in stores if s in file_stores]
@@ -546,18 +544,33 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
         pass
     del data["file_stores"][store_name]
     save_data(data)
-    return {"success": True, "deleted_store": store_name, "removed_size_bytes": removed_size}
+    return {
+        "success": True,
+        "deleted_store": store_name,
+        "removed_size_bytes": removed_size
+    }
 
 
+# ---------------- UPDATED: upload files AS-IS (no PDF conversion) ----------------
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(
     department: str,
     sem: str,
     store_name: str,
     limit: Optional[bool] = Form(True),
-    files: List[UploadFile] = File(...),
+    files: List[UploadFile] = File(...)
 ):
+    """
+    Upload files to a Gemini File Search store.
+
+    CHANGES from previous version:
+    - NO conversion to PDF.
+    - Whatever file the user uploads (docx, xlsx, png, txt, pdf, etc.) is sent
+      directly to Gemini File Search using upload_to_file_search_store.
+    - We still enforce MAX_FILE_BYTES and keep metadata the same.
+    """
     data = load_data()
+
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     if sem not in data["departments"][department].get("sems", {}):
@@ -582,13 +595,14 @@ async def upload_files_scoped(
     temp_folder.mkdir(parents=True, exist_ok=True)
 
     results = []
+
     for upload in files:
         original_filename = upload.filename or "file"
         filename = clean_filename(original_filename)
         temp_path = temp_folder / filename
         size = 0
 
-        # Save uploaded file
+        # Save uploaded file to disk (as-is, no conversion)
         try:
             async with aiofiles.open(temp_path, "wb") as out_f:
                 while True:
@@ -607,8 +621,11 @@ async def upload_files_scoped(
                         })
                         break
                     await out_f.write(chunk)
+
+            # If previous step marked as not uploaded, skip indexing
             if results and results[-1].get("uploaded") is False:
                 continue
+
         except Exception as e:
             results.append({
                 "filename": filename,
@@ -618,150 +635,13 @@ async def upload_files_scoped(
             })
             continue
 
-        # Detect file type
-        ext = filename.lower().split(".")[-1]
+        # Make sure we have final size
+        if size == 0 and temp_path.exists():
+            size = os.path.getsize(temp_path)
 
-        # ----------------------------------------------------------
-        # 1) IMAGE → COMPRESSED PDF
-        # ----------------------------------------------------------
-        if ext in ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff"]:
-            try:
-                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-                pdf_path = temp_folder / pdf_name
-
-                img = Image.open(temp_path).convert("RGB")
-                img.thumbnail((1500, 1500))  # reduce resolution
-
-                temp_img_jpg = str(temp_folder / "tmp_img.jpg")
-                img.save(temp_img_jpg, "JPEG", quality=70)
-
-                c = canvas.Canvas(str(pdf_path), pagesize=letter)
-                width, height = letter
-                iw, ih = img.size
-                scale = min(width / iw, height / ih)
-                iw *= scale
-                ih *= scale
-                c.drawImage(temp_img_jpg, 0, height - ih, width=iw, height=ih)
-                c.showPage()
-                c.save()
-
-                os.remove(temp_path)
-                temp_path = pdf_path
-                filename = pdf_name
-                size = os.path.getsize(temp_path)
-
-            except Exception as e:
-                results.append({
-                    "filename": filename,
-                    "uploaded": False,
-                    "indexed": False,
-                    "reason": f"Image→PDF conversion failed: {e}"
-                })
-                continue
-
-        # ----------------------------------------------------------
-        # 2) EXCEL/CSV → PDF
-        # ----------------------------------------------------------
-        elif ext in ["xlsx", "xls", "csv"]:
-            try:
-                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-                pdf_path = temp_folder / pdf_name
-
-                if ext == "csv":
-                    df = pd.read_csv(temp_path)
-                else:
-                    df = pd.read_excel(temp_path)
-
-                doc = SimpleDocTemplate(str(pdf_path), pagesize=letter)
-                elements = []
-                table_data = [df.columns.tolist()] + df.values.tolist()
-
-                table = Table(table_data)
-                table.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
-                ]))
-
-                elements.append(table)
-                doc.build(elements)
-
-                os.remove(temp_path)
-                temp_path = pdf_path
-                filename = pdf_name
-                size = os.path.getsize(temp_path)
-
-            except Exception as e:
-                results.append({
-                    "filename": filename,
-                    "uploaded": False,
-                    "indexed": False,
-                    "reason": f"Excel→PDF conversion failed: {e}"
-                })
-                continue
-
-        # ----------------------------------------------------------
-        # 3) OTHER NON-PDF FILES → PDF (generic text conversion)
-        # ----------------------------------------------------------
-        elif ext == "docx":
-            try:
-                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-                pdf_path = temp_folder / pdf_name
-
-                # Extract text from DOCX
-                docx_obj = Document(temp_path)
-                full_text = [p.text for p in docx_obj.paragraphs]
-                text_content = "\n".join(full_text)
-
-                # Convert to PDF
-                doc_pdf = SimpleDocTemplate(str(pdf_path), pagesize=letter)
-                styles = getSampleStyleSheet()
-                elements = [Paragraph(text_content.replace("\n", "<br/>"), styles["Normal"])]
-                doc_pdf.build(elements)
-
-                os.remove(temp_path)
-                temp_path = pdf_path
-                filename = pdf_name
-                size = os.path.getsize(temp_path)
-
-            except Exception as e:
-                results.append({
-                    "filename": filename,
-                    "uploaded": False,
-                    "indexed": False,
-                    "reason": f"DOCX→PDF conversion failed: {e}"
-                })
-                continue
-
-        elif ext != "pdf":
-            try:
-                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-                pdf_path = temp_folder / pdf_name
-
-                content = open(temp_path, "r", errors="ignore").read()
-
-                doc = SimpleDocTemplate(str(pdf_path), pagesize=letter)
-                styles = getSampleStyleSheet()
-                elements = [Paragraph(content.replace("\n", "<br/>"), styles["Normal"])]
-                doc.build(elements)
-
-                os.remove(temp_path)
-                temp_path = pdf_path
-                filename = pdf_name
-                size = os.path.getsize(temp_path)
-
-            except Exception as e:
-                results.append({
-                    "filename": filename,
-                    "uploaded": False,
-                    "indexed": False,
-                    "reason": f"Text→PDF conversion failed: {e}"
-                })
-                continue
-
-        # ----------------------------------------------------------
-        # UPLOAD TO GEMINI FILE SEARCH
-        # ----------------------------------------------------------
+        # ---------------------------
+        # Upload AS-IS to Gemini File Search
+        # ---------------------------
         document_resource = None
         document_id = None
         indexed_ok = False
@@ -775,11 +655,13 @@ async def upload_files_scoped(
             )
             op = wait_for_operation(client, op)
 
+            # Try to get document resource name
             try:
                 document_resource = op.response.file_search_document.name
             except Exception:
                 document_resource = None
 
+            # Fallback: list documents and match by displayName
             if not document_resource:
                 docs = rest_list_documents_for_store(fs_store_name, sem_key)
                 for d in docs:
@@ -794,11 +676,13 @@ async def upload_files_scoped(
         except Exception as e:
             gemini_error = str(e)
 
+        # Remove local temp file (we only keep metadata)
         try:
             os.remove(temp_path)
         except Exception:
             pass
 
+        # Save metadata
         entry = {
             "display_name": filename,
             "size_bytes": size,
@@ -931,14 +815,15 @@ def department_usage(department: str):
         "sems": sems_sizes
     }
 
-
 # ---------------- Gemini extraction / selection / RAG helpers ----------------
+
+
 def _extract_system_and_query_sync(client, raw_text: str) -> str:
     system_prompt = (
         "You are a parser. Extract ONLY two things from the user's message as valid JSON:\n"
         "1) system_prompt: any instructions that tell the assistant HOW to behave (tone/style/format).\n"
         "2) user_query: the actual question to be answered.\n"
-        'Return EXACT JSON: {"system_prompt": "...", "user_query": "...".}'
+        "Return EXACT JSON: {\"system_prompt\": \"...\", \"user_query\": \"...\"}."
     )
     model = "gemini-2.5-flash"
     response = client.models.generate_content(
@@ -1002,7 +887,11 @@ If nothing matches, return stores: [] and put original question into unanswered.
     return txt or ""
 
 
-async def _call_gemini_for_store_selection(stores: List[str], question: str, sem_key: str) -> Dict:
+async def _call_gemini_for_store_selection(
+    stores: List[str],
+    question: str,
+    sem_key: str
+) -> Dict:
     if not stores:
         return {"stores": [], "split_questions": {}, "unanswered": []}
     if genai is None:
@@ -1010,14 +899,20 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str, sem
     loop = asyncio.get_running_loop()
     try:
         client = await loop.run_in_executor(None, init_gemini_client, sem_key)
-        raw = await loop.run_in_executor(None, _call_gemini_store_selector_sync, client, stores, question)
+        raw = await loop.run_in_executor(
+            None,
+            _call_gemini_store_selector_sync,
+            client,
+            stores,
+            question
+        )
         if not raw:
             return {"stores": stores, "split_questions": {}, "unanswered": []}
         parsed = _parse_json_loose(raw)
         return {
             "stores": parsed.get("stores", []) or [],
             "split_questions": parsed.get("split_questions", {}) or {},
-            "unanswered": parsed.get("unanswered", []) or [],
+            "unanswered": parsed.get("unanswered", []) or []
         }
     except Exception:
         return {"stores": stores, "split_questions": {}, "unanswered": []}
@@ -1101,9 +996,8 @@ def _merge_answers_apply_system(
         "You are an assistant that MUST produce a single final answer formatted using the following system instructions:\n"
         f"{system_prompt}\n\n"
         "You are given answers from multiple service stores below. Combine them into a single coherent answer, "
-        "avoid repetition, keep facts only, and follow the system instructions provided above. "
-        "If some parts are missing, mention that. Use the minimal necessary additional phrasing. "
-        "Return only the final answer text.\n\n"
+        "avoid repetition, keep facts only, and follow the system instructions provided above. If some parts are missing, "
+        "mention that. Use the minimal necessary additional phrasing. Return only the final answer text.\n\n"
         f"CONTEXT: \n{combined_text}\n"
     )
     try:
@@ -1127,10 +1021,11 @@ def _merge_answers_apply_system(
             parts.append(f"{fa.get('store')}: {fa.get('answer')}")
         return "\n\n".join(parts)
 
-
 # =====================================================
 # ASK endpoint implementation (no session, no storing Q/A)
 # =====================================================
+
+
 @app.post("/departments/{department}/sems/{sem}/ask")
 async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
     question = payload.get("question") if isinstance(payload, dict) else None
@@ -1178,7 +1073,7 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
                 txt = part.get("text") or ""
                 reason = part.get("reason") or ""
                 if txt:
-                    extra.append(f'- "{txt}" ({reason})' if reason else f'- "{txt}"')
+                    extra.append(f"- \"{txt}\" ({reason})" if reason else f"- \"{txt}\"")
             if extra:
                 resp_text += "\n\nDetails:\n" + "\n".join(extra)
         return {
@@ -1194,14 +1089,16 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
     tasks = []
     for store in selected_stores:
         q = split_q.get(store, user_query)
-        tasks.append(asyncio.create_task(
-            _call_rag_for_store(
-                sem_key,
-                store,
-                q,
-                system_prompt if send_system_to_rag else None
+        tasks.append(
+            asyncio.create_task(
+                _call_rag_for_store(
+                    sem_key,
+                    store,
+                    q,
+                    system_prompt if send_system_to_rag else None
+                )
             )
-        ))
+        )
 
     results = await asyncio.gather(*tasks)
 
@@ -1248,13 +1145,13 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
             if not txt:
                 continue
             if reason:
-                extra_lines.append(f'- "{txt}" ({reason})')
+                extra_lines.append(f"- \"{txt}\" ({reason})")
             else:
-                extra_lines.append(f'- "{txt}"')
+                extra_lines.append(f"- \"{txt}\"")
         if extra_lines:
             merged_text += (
-                "\n\nThe following parts of your question could not be answered "
-                "by any available service department:\n" + "\n".join(extra_lines)
+                "\n\nThe following parts of your question could not be answered by any available service department:\n"
+                + "\n".join(extra_lines)
             )
 
     return {
@@ -1265,12 +1162,12 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         "unanswered_parts": unanswered_parts
     }
 
-
 # ---------------- Misc endpoints ----------------
+
+
 @app.get("/health")
 def health_check():
     return {"success": True, "status": "ok"}
-
 
 # ---------------- Startup quick writable-check ----------------
 try:
@@ -1284,7 +1181,6 @@ except Exception as e:
         e,
         UPLOAD_ROOT,
     )
-
 
 # ---------------- Run guidance ----------------
 if __name__ == "__main__":
