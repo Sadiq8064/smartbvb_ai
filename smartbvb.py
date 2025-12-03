@@ -99,11 +99,16 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 # Path for persistent JSON metadata file (can be overridden with env var)
-DATA_FILE = os.getenv("DATA_FILE", "/data/gemini_stores.json")
-UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "/data/uploads"))
+# Use /tmp for Cloud Run (only writable dir)
+DEFAULT_DATA_ROOT = os.getenv("DATA_ROOT", "/tmp")
+
+DATA_FILE = os.getenv("DATA_FILE", str(Path(DEFAULT_DATA_ROOT) / "gemini_stores.json"))
+UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", str(Path(DEFAULT_DATA_ROOT) / "uploads")))
+
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", 50 * 1024 * 1024))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2))
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 
 # Simple admin creds for local/dev testing (not secure for production)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "mrsadiq471@gmail.com")
