@@ -62,7 +62,9 @@ except Exception as e:
             return f"JSONResponse(status_code={self.status_code}, content={self.content})"
 
     def UploadFile(*args, **kwargs):
-        class _UF: pass
+        class _UF:
+            pass
+
         return _UF
 
     def File(*args, **kwargs):
@@ -89,6 +91,7 @@ except Exception as e:
                 except Exception:
                     pass
 
+
 # Try to import google-genai SDK; if missing, set to None and endpoints will return clear error
 try:
     from google import genai
@@ -109,7 +112,6 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", 50 * 1024 * 1024))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 2))
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-
 # Simple admin creds for local/dev testing (not secure for production)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "mrsadiq471@gmail.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "sadiq^8064")
@@ -129,13 +131,14 @@ try:
 except Exception:
     pass
 
-# ---------------- Helpers: persistence ----------------
 
+# ---------------- Helpers: persistence ----------------
 def ensure_dirs():
     try:
         UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         logger.debug("Could not create upload root: %s", e)
+
 
 def _ensure_data_file_initial():
     """
@@ -188,6 +191,7 @@ def _ensure_data_file_initial():
 
     return DATA_FILE
 
+
 def load_data() -> Dict[str, Any]:
     """
     Load JSON metadata from DATA_FILE. If file is missing/corrupt, attempt to reinitialize.
@@ -211,16 +215,17 @@ def load_data() -> Dict[str, Any]:
             with open(DATA_FILE, "r") as f2:
                 return json.load(f2)
 
+
 def save_data(data: Dict[str, Any]):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
 
 # Run initial ensures
 ensure_dirs()
 _ensure_data_file_initial()
 
 # ---------------- Utilities ----------------
-
 def clean_filename(name: str, max_len: int = 180) -> str:
     if not name:
         return "file"
@@ -236,8 +241,8 @@ def clean_filename(name: str, max_len: int = 180) -> str:
         return "file"
     return name
 
-# ---------------- Gemini helpers ----------------
 
+# ---------------- Gemini helpers ----------------
 def init_gemini_client(api_key: str):
     if genai is None:
         raise RuntimeError("google-genai SDK is not installed on the server.")
@@ -245,6 +250,7 @@ def init_gemini_client(api_key: str):
         return genai.Client(api_key=api_key)
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+
 
 def wait_for_operation(client, operation):
     op = operation
@@ -260,6 +266,7 @@ def wait_for_operation(client, operation):
         raise RuntimeError(f"Operation failed: {op.error}")
     return op
 
+
 def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     url = f"{GEMINI_REST_BASE}/{file_search_store_name}/documents"
     params = {"key": api_key}
@@ -271,8 +278,8 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     except Exception:
         return []
 
-# ---------------- Admin endpoints ----------------
 
+# ---------------- Admin endpoints ----------------
 @app.post("/admin/login")
 def admin_login(email: str = Form(...), password: str = Form(...)):
     """
@@ -283,6 +290,7 @@ def admin_login(email: str = Form(...), password: str = Form(...)):
         return JSONResponse({"error": "Invalid credentials"}, status_code=401)
 
     return {"success": True, "message": "Admin authenticated"}
+
 
 @app.post("/admin/departments/create")
 def create_department(department_name: str = Form(...)):
@@ -297,10 +305,12 @@ def create_department(department_name: str = Form(...)):
     save_data(data)
     return {"success": True, "department": department_name}
 
+
 @app.get("/admin/departments")
 def list_departments():
     data = load_data()
     return {"success": True, "departments": list(data.get("departments", {}).keys())}
+
 
 @app.delete("/admin/departments/{department}")
 def delete_department(department: str):
@@ -338,6 +348,7 @@ def delete_department(department: str):
     del data["departments"][department]
     save_data(data)
     return {"success": True, "deleted_department": department}
+
 
 @app.post("/admin/departments/{department}/sems/create")
 def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str = Form(...)):
@@ -435,6 +446,7 @@ def delete_sem(department: str, sem: str):
     save_data(data)
     return {"success": True, "deleted_sem": sem}
 
+
 @app.post("/admin/departments/{department}/sems/{sem}/stores/create")
 def create_store_in_sem(department: str, sem: str, store_name: str = Form(...)):
     data = load_data()
@@ -463,11 +475,23 @@ def create_store_in_sem(department: str, sem: str, store_name: str = Form(...)):
         return JSONResponse({"error": "A local store with this name already exists"}, status_code=400)
 
     created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    file_entry = {"store_name": store_name, "file_search_store_name": fs_store_name, "created_at": created_at, "files": [], "total_size_bytes": 0}
+    file_entry = {
+        "store_name": store_name,
+        "file_search_store_name": fs_store_name,
+        "created_at": created_at,
+        "files": [],
+        "total_size_bytes": 0
+    }
     file_stores[store_name] = file_entry
     sem_meta.setdefault("stores", []).append(store_name)
     save_data(data)
-    return {"success": True, "store_name": store_name, "file_search_store_resource": fs_store_name, "created_at": created_at}
+    return {
+        "success": True,
+        "store_name": store_name,
+        "file_search_store_resource": fs_store_name,
+        "created_at": created_at
+    }
+
 
 @app.get("/departments/{department}/sems/{sem}/stores")
 def list_stores_in_sem(department: str, sem: str):
@@ -480,6 +504,7 @@ def list_stores_in_sem(department: str, sem: str):
     file_stores = data.get("file_stores", {})
     result = [file_stores.get(s) for s in stores if s in file_stores]
     return {"success": True, "stores": result}
+
 
 @app.delete("/departments/{department}/sems/{sem}/stores/{store_name}")
 def delete_store_scoped(department: str, sem: str, store_name: str):
@@ -523,8 +548,15 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
     save_data(data)
     return {"success": True, "deleted_store": store_name, "removed_size_bytes": removed_size}
 
+
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
-async def upload_files_scoped(department: str, sem: str, store_name: str, limit: Optional[bool] = Form(True), files: List[UploadFile] = File(...)):
+async def upload_files_scoped(
+    department: str,
+    sem: str,
+    store_name: str,
+    limit: Optional[bool] = Form(True),
+    files: List[UploadFile] = File(...),
+):
     data = load_data()
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
@@ -646,9 +678,9 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
 
                 table = Table(table_data)
                 table.setStyle(TableStyle([
-                    ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-                    ("GRID", (0,0), (-1,-1), 0.25, colors.black),
-                    ("FONTSIZE", (0,0), (-1,-1), 7),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
                 ]))
 
                 elements.append(table)
@@ -671,30 +703,35 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
         # ----------------------------------------------------------
         # 3) OTHER NON-PDF FILES → PDF (generic text conversion)
         # ----------------------------------------------------------
-        
-
         elif ext == "docx":
             try:
-        pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
-        pdf_path = temp_folder / pdf_name
+                pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+                pdf_path = temp_folder / pdf_name
 
-        # Extract text from DOCX
-        doc = Document(temp_path)
-        full_text = []
-        for para in doc.paragraphs:
-            full_text.append(para.text)
-        text_content = "\n".join(full_text)
+                # Extract text from DOCX
+                docx_obj = Document(temp_path)
+                full_text = [p.text for p in docx_obj.paragraphs]
+                text_content = "\n".join(full_text)
 
-        # Convert to PDF
-        doc_pdf = SimpleDocTemplate(str(pdf_path), pagesize=letter)
-        styles = getSampleStyleSheet()
-        elements = [Paragraph(text_content.replace("\n", "<br/>"), styles["Normal"])]
-        doc_pdf.build(elements)
+                # Convert to PDF
+                doc_pdf = SimpleDocTemplate(str(pdf_path), pagesize=letter)
+                styles = getSampleStyleSheet()
+                elements = [Paragraph(text_content.replace("\n", "<br/>"), styles["Normal"])]
+                doc_pdf.build(elements)
 
-        os.remove(temp_path)
-        temp_path = pdf_path
-        filename = pdf_name
-        size = os.path.getsize(temp_path)
+                os.remove(temp_path)
+                temp_path = pdf_path
+                filename = pdf_name
+                size = os.path.getsize(temp_path)
+
+            except Exception as e:
+                results.append({
+                    "filename": filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"DOCX→PDF conversion failed: {e}"
+                })
+                continue
 
         elif ext != "pdf":
             try:
@@ -797,6 +834,7 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
         "sem_total_bytes": sem_total_bytes
     }
 
+
 @app.get("/departments/{department}/sems/{sem}/stores/{store_name}/files")
 def list_files_in_store(department: str, sem: str, store_name: str):
     data = load_data()
@@ -809,6 +847,7 @@ def list_files_in_store(department: str, sem: str, store_name: str):
     if store_name not in data.get("file_stores", {}):
         raise HTTPException(status_code=404, detail="Store metadata missing")
     return {"success": True, "files": data["file_stores"][store_name].get("files", [])}
+
 
 @app.delete("/departments/{department}/sems/{sem}/stores/{store_name}/documents/{document_id}")
 def delete_document_scoped(department: str, sem: str, store_name: str, document_id: str):
@@ -848,7 +887,12 @@ def delete_document_scoped(department: str, sem: str, store_name: str, document_
     sem_meta["total_size_bytes"] = max(0, sem_meta.get("total_size_bytes", 0) - removed_size)
     data["file_stores"][store_name] = meta
     save_data(data)
-    return {"success": True, "deleted_document_id": document_id, "removed_size_bytes": removed_size}
+    return {
+        "success": True,
+        "deleted_document_id": document_id,
+        "removed_size_bytes": removed_size
+    }
+
 
 @app.get("/departments/{department}/sems/{sem}/usage")
 def sem_usage(department: str, sem: str):
@@ -863,9 +907,10 @@ def sem_usage(department: str, sem: str):
     store_sizes = {}
     for s in stores:
         if s in file_stores:
-            store_sizes[s] = f"{round(file_stores[s].get('total_size_bytes', 0) / (1024*1024), 2)} MB"
-    sem_total = f"{round(sem_meta.get('total_size_bytes', 0) / (1024*1024), 2)} MB"
+            store_sizes[s] = f"{round(file_stores[s].get('total_size_bytes', 0) / (1024 * 1024), 2)} MB"
+    sem_total = f"{round(sem_meta.get('total_size_bytes', 0) / (1024 * 1024), 2)} MB"
     return {"success": True, "store_sizes": store_sizes, "sem_total": sem_total}
+
 
 @app.get("/admin/departments/{department}/usage")
 def department_usage(department: str):
@@ -878,30 +923,38 @@ def department_usage(department: str):
     total = 0
     for sem_name, sem_meta in sems.items():
         b = sem_meta.get("total_size_bytes", 0)
-        sems_sizes[sem_name] = f"{round(b / (1024*1024), 2)} MB"
+        sems_sizes[sem_name] = f"{round(b / (1024 * 1024), 2)} MB"
         total += b
-    return {"success": True, "department_total": f"{round(total / (1024*1024), 2)} MB", "sems": sems_sizes}
+    return {
+        "success": True,
+        "department_total": f"{round(total / (1024 * 1024), 2)} MB",
+        "sems": sems_sizes
+    }
+
 
 # ---------------- Gemini extraction / selection / RAG helpers ----------------
-
 def _extract_system_and_query_sync(client, raw_text: str) -> str:
     system_prompt = (
         "You are a parser. Extract ONLY two things from the user's message as valid JSON:\n"
         "1) system_prompt: any instructions that tell the assistant HOW to behave (tone/style/format).\n"
         "2) user_query: the actual question to be answered.\n"
-        "Return EXACT JSON: {\"system_prompt\": \"...\", \"user_query\": \"...\"}."
+        'Return EXACT JSON: {"system_prompt": "...", "user_query": "...".}'
     )
     model = "gemini-2.5-flash"
     response = client.models.generate_content(
         model=model,
         contents=raw_text,
-        config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.0)
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.0
+        )
     )
     txt = getattr(response, "text", None)
     if not txt and getattr(response, "candidates", None):
         c = response.candidates[0]
         txt = getattr(c, "text", None) or getattr(c, "content", None)
     return txt or ""
+
 
 def _parse_json_loose(raw: str) -> Dict:
     raw = (raw or "").strip()
@@ -914,10 +967,11 @@ def _parse_json_loose(raw: str) -> Dict:
         end = raw.rfind("}")
         if start != -1 and end != -1:
             try:
-                return json.loads(raw[start:end+1])
+                return json.loads(raw[start:end + 1])
             except Exception:
                 return {"system_prompt": "", "user_query": raw}
         return {"system_prompt": "", "user_query": raw}
+
 
 def _call_gemini_store_selector_sync(client, stores: List[str], question: str) -> str:
     model = "gemini-2.5-flash"
@@ -936,13 +990,17 @@ If nothing matches, return stores: [] and put original question into unanswered.
     response = client.models.generate_content(
         model=model,
         contents=question,
-        config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.0)
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.0
+        )
     )
     txt = getattr(response, "text", None)
     if not txt and getattr(response, "candidates", None):
         c = response.candidates[0]
         txt = getattr(c, "text", None) or getattr(c, "content", None)
     return txt or ""
+
 
 async def _call_gemini_for_store_selection(stores: List[str], question: str, sem_key: str) -> Dict:
     if not stores:
@@ -956,23 +1014,45 @@ async def _call_gemini_for_store_selection(stores: List[str], question: str, sem
         if not raw:
             return {"stores": stores, "split_questions": {}, "unanswered": []}
         parsed = _parse_json_loose(raw)
-        return {"stores": parsed.get("stores", []) or [], "split_questions": parsed.get("split_questions", {}) or {}, "unanswered": parsed.get("unanswered", []) or []}
+        return {
+            "stores": parsed.get("stores", []) or [],
+            "split_questions": parsed.get("split_questions", {}) or {},
+            "unanswered": parsed.get("unanswered", []) or [],
+        }
     except Exception:
         return {"stores": stores, "split_questions": {}, "unanswered": []}
 
-async def _call_rag_for_store(sem_key: str, store: str, question: str, system_prompt: Optional[str] = None) -> Dict:
+
+async def _call_rag_for_store(
+    sem_key: str,
+    store: str,
+    question: str,
+    system_prompt: Optional[str] = None
+) -> Dict:
     if genai is None:
         return {"error": True, "detail": "Gemini SDK missing"}
     loop = asyncio.get_running_loop()
+
     def _sync_call():
         client = init_gemini_client(sem_key)
-        cfg_prompt = system_prompt or ("You are a bot assisting citizens. Answer ONLY using File Search documents. If info missing, say: 'Sorry, no information available.'")
-        file_search_tool = types.Tool(file_search=types.FileSearch(file_search_store_names=[data_store_name_for(store)]))
+        cfg_prompt = system_prompt or (
+            "You are a bot assisting citizens. Answer ONLY using File Search documents. "
+            "If info missing, say: 'Sorry, no information available.'"
+        )
+        file_search_tool = types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=[data_store_name_for(store)]
+            )
+        )
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=question,
-                config=types.GenerateContentConfig(system_instruction=cfg_prompt, tools=[file_search_tool], temperature=0.0)
+                config=types.GenerateContentConfig(
+                    system_instruction=cfg_prompt,
+                    tools=[file_search_tool],
+                    temperature=0.0
+                )
             )
             txt = getattr(response, "text", None)
             if not txt and getattr(response, "candidates", None):
@@ -981,16 +1061,33 @@ async def _call_rag_for_store(sem_key: str, store: str, question: str, system_pr
             grounding = None
             if hasattr(response, "candidates") and len(response.candidates) > 0:
                 grounding = getattr(response.candidates[0], "grounding_metadata", None)
-            return {"store": store, "question": question, "answer": txt or "", "grounding": grounding}
+            return {
+                "store": store,
+                "question": question,
+                "answer": txt or "",
+                "grounding": grounding
+            }
         except Exception as e:
-            return {"store": store, "question": question, "answer": "", "error": str(e)}
+            return {
+                "store": store,
+                "question": question,
+                "answer": "",
+                "error": str(e)
+            }
+
     return await loop.run_in_executor(None, _sync_call)
+
 
 def data_store_name_for(local_store_name: str) -> str:
     d = load_data()
     return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
 
-def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers: List[Dict]) -> str:
+
+def _merge_answers_apply_system(
+    sem_key: str,
+    system_prompt: str,
+    final_answers: List[Dict]
+) -> str:
     if not final_answers:
         return ""
     combined = []
@@ -1003,7 +1100,10 @@ def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers:
     merge_instr = (
         "You are an assistant that MUST produce a single final answer formatted using the following system instructions:\n"
         f"{system_prompt}\n\n"
-        "You are given answers from multiple service stores below. Combine them into a single coherent answer, avoid repetition, keep facts only, and follow the system instructions provided above. If some parts are missing, mention that. Use the minimal necessary additional phrasing. Return only the final answer text.\n\n"
+        "You are given answers from multiple service stores below. Combine them into a single coherent answer, "
+        "avoid repetition, keep facts only, and follow the system instructions provided above. "
+        "If some parts are missing, mention that. Use the minimal necessary additional phrasing. "
+        "Return only the final answer text.\n\n"
         f"CONTEXT: \n{combined_text}\n"
     )
     try:
@@ -1011,7 +1111,10 @@ def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=combined_text,
-            config=types.GenerateContentConfig(system_instruction=merge_instr, temperature=0.0)
+            config=types.GenerateContentConfig(
+                system_instruction=merge_instr,
+                temperature=0.0
+            )
         )
         txt = getattr(response, "text", None)
         if not txt and getattr(response, "candidates", None):
@@ -1024,10 +1127,10 @@ def _merge_answers_apply_system(sem_key: str, system_prompt: str, final_answers:
             parts.append(f"{fa.get('store')}: {fa.get('answer')}")
         return "\n\n".join(parts)
 
+
 # =====================================================
 # ASK endpoint implementation (no session, no storing Q/A)
 # =====================================================
-
 @app.post("/departments/{department}/sems/{sem}/ask")
 async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
     question = payload.get("question") if isinstance(payload, dict) else None
@@ -1075,17 +1178,30 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
                 txt = part.get("text") or ""
                 reason = part.get("reason") or ""
                 if txt:
-                    extra.append(f"- \"{txt}\" ({reason})" if reason else f"- \"{txt}\"")
+                    extra.append(f'- "{txt}" ({reason})' if reason else f'- "{txt}"')
             if extra:
                 resp_text += "\n\nDetails:\n" + "\n".join(extra)
-        return {"success": True, "response": resp_text, "stores_used": [], "sources": [], "unanswered_parts": unanswered_parts}
+        return {
+            "success": True,
+            "response": resp_text,
+            "stores_used": [],
+            "sources": [],
+            "unanswered_parts": unanswered_parts
+        }
 
     # Step 3: per-store RAG calls
     send_system_to_rag = len(selected_stores) == 1 and bool(system_prompt.strip())
     tasks = []
     for store in selected_stores:
         q = split_q.get(store, user_query)
-        tasks.append(asyncio.create_task(_call_rag_for_store(sem_key, store, q, system_prompt if send_system_to_rag else None)))
+        tasks.append(asyncio.create_task(
+            _call_rag_for_store(
+                sem_key,
+                store,
+                q,
+                system_prompt if send_system_to_rag else None
+            )
+        ))
 
     results = await asyncio.gather(*tasks)
 
@@ -1104,7 +1220,12 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
                 ctx = c.get("retrievedContext", {})
                 if ctx.get("text"):
                     sources.append(ctx["text"])
-        final_answers.append({"store": r.get("store"), "question": r.get("question"), "answer": answer_text, "sources": sources})
+        final_answers.append({
+            "store": r.get("store"),
+            "question": r.get("question"),
+            "answer": answer_text,
+            "sources": sources
+        })
         all_sources.extend(sources)
 
     # Step 4: merge
@@ -1127,18 +1248,29 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
             if not txt:
                 continue
             if reason:
-                extra_lines.append(f"- \"{txt}\" ({reason})")
+                extra_lines.append(f'- "{txt}" ({reason})')
             else:
-                extra_lines.append(f"- \"{txt}\"")
+                extra_lines.append(f'- "{txt}"')
         if extra_lines:
-            merged_text += "\n\nThe following parts of your question could not be answered by any available service department:\n" + "\n".join(extra_lines)
+            merged_text += (
+                "\n\nThe following parts of your question could not be answered "
+                "by any available service department:\n" + "\n".join(extra_lines)
+            )
 
-    return {"success": True, "response": merged_text, "stores_used": selected_stores, "sources": all_sources[:1], "unanswered_parts": unanswered_parts}
+    return {
+        "success": True,
+        "response": merged_text,
+        "stores_used": selected_stores,
+        "sources": all_sources[:1],
+        "unanswered_parts": unanswered_parts
+    }
+
 
 # ---------------- Misc endpoints ----------------
 @app.get("/health")
 def health_check():
     return {"success": True, "status": "ok"}
+
 
 # ---------------- Startup quick writable-check ----------------
 try:
@@ -1147,8 +1279,16 @@ try:
     test_path.write_text("ok")
     test_path.unlink()
 except Exception as e:
-    logger.error("Upload root not writable or cannot create test file: %s (UPLOAD_ROOT=%s)", e, UPLOAD_ROOT)
+    logger.error(
+        "Upload root not writable or cannot create test file: %s (UPLOAD_ROOT=%s)",
+        e,
+        UPLOAD_ROOT,
+    )
+
 
 # ---------------- Run guidance ----------------
 if __name__ == "__main__":
-    print("This module is intended to be run with Uvicorn, e.g.:\n    uvicorn smartbvb:app --host 0.0.0.0 --port 8000")
+    print(
+        "This module is intended to be run with Uvicorn, e.g.:\n"
+        "    uvicorn smartbvb:app --host 0.0.0.0 --port 8000"
+    )
