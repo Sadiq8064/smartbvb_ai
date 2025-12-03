@@ -21,6 +21,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
+from docx import Document
 import os
 import time
 import json
@@ -665,6 +666,31 @@ async def upload_files_scoped(department: str, sem: str, store_name: str, limit:
         # ----------------------------------------------------------
         # 3) OTHER NON-PDF FILES → PDF (generic text conversion)
         # ----------------------------------------------------------
+        
+
+        elif ext == "docx":
+            try:
+        pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
+        pdf_path = temp_folder / pdf_name
+
+        # Extract text from DOCX
+        doc = Document(temp_path)
+        full_text = []
+        for para in doc.paragraphs:
+            full_text.append(para.text)
+        text_content = "\n".join(full_text)
+
+        # Convert to PDF
+        doc_pdf = SimpleDocTemplate(str(pdf_path), pagesize=letter)
+        styles = getSampleStyleSheet()
+        elements = [Paragraph(text_content.replace("\n", "<br/>"), styles["Normal"])]
+        doc_pdf.build(elements)
+
+        os.remove(temp_path)
+        temp_path = pdf_path
+        filename = pdf_name
+        size = os.path.getsize(temp_path)
+
         elif ext != "pdf":
             try:
                 pdf_name = filename.rsplit(".", 1)[0] + ".pdf"
