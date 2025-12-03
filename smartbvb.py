@@ -1,4 +1,4 @@
-]# smartbvb.py
+
 """
 FastAPI backend (smartbvb) — clean production/testing-ready single-file API.
 
