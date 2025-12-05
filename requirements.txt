@@ -10,3 +10,6 @@ pandas
 openpyxl
 reportlab
 python-docx
+PyMuPDF
+pytesseract
+docx2txt
