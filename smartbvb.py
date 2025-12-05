@@ -1,19 +1,29 @@
+# ============================
+# smartbvb.py  (PART 1 / 3)
+# ============================
 """
 FastAPI backend (smartbvb) — clean production/testing-ready single-file API.
 
-Features:
-- Admin / Departments / Sems / Stores
-- Sems store Gemini API keys (used for all operations under that sem)
-- Upload / delete files (indexing into Gemini File Search)
-- ASK endpoint: extract system_prompt + user_query, select stores via Gemini, call RAG per-store, merge answers applying system_prompt only at final merge
-- Recursive delete for sem and department
+University use-case:
 
-Important constraints per user request:
+- Admin / Departments / Semesters / Stores
+- Each Sem stores a Gemini API key (used for all operations under that sem)
+- Upload / delete files (PDF / images / DOCX) → OCR → text → index into Gemini File Search
+- ASK endpoint:
+    - Extract system_prompt + user_query from the student's message
+    - Select relevant stores via Gemini
+    - Run RAG per-store (File Search)
+    - Merge answers, applying the system_prompt only at final merge
+
+Important constraints:
+
 - NO session management
-- DO NOT store question/answer text anywhere (only metadata about stores/files is kept)
+- DO NOT store question/answer text anywhere
+  (only metadata about stores/files is kept)
 - CORS enabled for testing: allows calls from anywhere
 """
-from PIL import Image  # kept from previous version
+
+from PIL import Image  # OCR image handling
 import pandas as pd
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -21,6 +31,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from docx import Document
+
 import os
 import time
 import json
@@ -32,7 +43,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import mimetypes  # MIME detection
-import tempfile
+import tempfile   # temp files for OCR etc.
 
 # OCR-related imports
 import pytesseract
@@ -48,6 +59,7 @@ try:
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import aiofiles
+
     FASTAPI_AVAILABLE = True
 except Exception as e:
     logger.warning("FastAPI or aiofiles import failed: %s. Running in limited mode.", e)
@@ -105,6 +117,7 @@ except Exception:
     types = None
 
 # ---------------- CONFIG ----------------
+
 # Path for persistent JSON metadata file (can be overridden with env var)
 # Use /tmp for Cloud Run (only writable dir)
 DEFAULT_DATA_ROOT = os.getenv("DATA_ROOT", "/tmp")
@@ -135,8 +148,8 @@ try:
 except Exception:
     pass
 
-# ---------------- Helpers: persistence ----------------
 
+# ---------------- Helpers: persistence ----------------
 
 def ensure_dirs():
     try:
@@ -149,6 +162,7 @@ def _ensure_data_file_initial():
     """
     Ensure a usable DATA_FILE exists. If DATA_FILE points to an existing directory,
     we will write a gemini_stores.json file inside that directory and adjust DATA_FILE.
+
     Returns the path used for the data file (may update global DATA_FILE).
     """
     global DATA_FILE
@@ -159,7 +173,10 @@ def _ensure_data_file_initial():
 
     # If DATA_FILE is a directory, recover by using DATA_FILE/gemini_stores.json
     if os.path.isdir(DATA_FILE):
-        logger.warning("DATA_FILE path %s is a directory. Using %s/gemini_stores.json instead.", DATA_FILE, DATA_FILE)
+        logger.warning(
+            "DATA_FILE path %s is a directory. Using %s/gemini_stores.json instead.",
+            DATA_FILE, DATA_FILE
+        )
         alt = os.path.join(DATA_FILE, "gemini_stores.json")
         try:
             os.makedirs(DATA_FILE, exist_ok=True)
@@ -178,12 +195,17 @@ def _ensure_data_file_initial():
         if parent and not os.path.exists(parent):
             os.makedirs(parent, exist_ok=True)
     except Exception as e:
-        logger.error("Could not create parent directory for DATA_FILE (%s): %s", parent, e)
+        logger.error(
+            "Could not create parent directory for DATA_FILE (%s): %s",
+            parent, e
+        )
         raise
 
     # If path somehow became a directory, error (can't proceed)
     if os.path.isdir(DATA_FILE):
-        raise RuntimeError(f"DATA_FILE path {DATA_FILE} is a directory and cannot be used as a file.")
+        raise RuntimeError(
+            f"DATA_FILE path {DATA_FILE} is a directory and cannot be used as a file."
+        )
 
     # Create the file if missing
     if not os.path.exists(DATA_FILE):
@@ -230,8 +252,8 @@ def save_data(data: Dict[str, Any]):
 ensure_dirs()
 _ensure_data_file_initial()
 
-# ---------------- Utilities ----------------
 
+# ---------------- Utilities ----------------
 
 def clean_filename(name: str, max_len: int = 180) -> str:
     if not name:
@@ -282,12 +304,13 @@ def normalize_mime_type(mime: Optional[str]) -> Optional[str]:
 
     return mime
 
-# ---------------- OCR HELPERS (PDF / IMAGE / DOCX → TEXT) ----------------
 
+# ---------------- OCR HELPERS (PDF / IMAGE / DOCX → TEXT) ----------------
 
 async def extract_text_from_pdf(file_bytes: bytes) -> str:
     """
     Convert a PDF (bytes) into text using PyMuPDF + Tesseract.
+    Good for scanned PDFs, question papers, notes, etc.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
@@ -315,6 +338,7 @@ async def extract_text_from_pdf(file_bytes: bytes) -> str:
 async def extract_text_from_image(file_bytes: bytes) -> str:
     """
     Convert an image (bytes) into text using Tesseract.
+    For photographed notes, board pictures, etc.
     """
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(file_bytes)
@@ -328,6 +352,7 @@ async def extract_text_from_image(file_bytes: bytes) -> str:
 async def extract_text_from_docx(file_bytes: bytes) -> str:
     """
     Convert a DOCX (bytes) into plain text using docx2txt.
+    For lesson plans, typed notes, etc.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         tmp.write(file_bytes)
@@ -336,8 +361,8 @@ async def extract_text_from_docx(file_bytes: bytes) -> str:
     extracted_text = docx2txt.process(docx_path)
     return extracted_text
 
-# ---------------- Gemini helpers (basic) ----------------
 
+# ---------------- Gemini helpers (basic) ----------------
 
 def init_gemini_client(api_key: str):
     if genai is None:
@@ -374,8 +399,8 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     except Exception:
         return []
 
-# ---------------- Admin endpoints ----------------
 
+# ---------------- Admin endpoints ----------------
 
 @app.post("/admin/login")
 def admin_login(email: str = Form(...), password: str = Form(...)):
@@ -427,7 +452,10 @@ def delete_department(department: str):
                     if sem_key and genai is not None:
                         client = init_gemini_client(sem_key)
                         try:
-                            client.file_search_stores.delete(name=fs, config={"force": True})
+                            client.file_search_stores.delete(
+                                name=fs,
+                                config={"force": True}
+                            )
                         except Exception:
                             pass
                 except Exception:
@@ -448,7 +476,11 @@ def delete_department(department: str):
 
 
 @app.post("/admin/departments/{department}/sems/create")
-def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str = Form(...)):
+def create_sem(
+    department: str,
+    sem_name: str = Form(...),
+    gemini_api_key: str = Form(...)
+):
     data = load_data()
 
     if department not in data.get("departments", {}):
@@ -456,7 +488,10 @@ def create_sem(department: str, sem_name: str = Form(...), gemini_api_key: str =
 
     sems = data["departments"][department].setdefault("sems", {})
     if sem_name in sems:
-        return JSONResponse({"error": "Sem already exists in the department"}, status_code=400)
+        return JSONResponse(
+            {"error": "Sem already exists in the department"},
+            status_code=400
+        )
 
     # validate GEMINI API KEY using real call
     try:
@@ -498,7 +533,9 @@ def list_sems(department: str):
         "success": True,
         "sems": list(data["departments"][department].get("sems", {}).keys())
     }
-
+# ============================
+# smartbvb.py  (PART 2 / 3)
+# ============================
 
 @app.delete("/admin/departments/{department}/sems/{sem}")
 def delete_sem(department: str, sem: str):
@@ -519,7 +556,10 @@ def delete_sem(department: str, sem: str):
                 if sem_key and genai is not None:
                     client = init_gemini_client(sem_key)
                     try:
-                        client.file_search_stores.delete(name=fs, config={"force": True})
+                        client.file_search_stores.delete(
+                            name=fs,
+                            config={"force": True}
+                        )
                     except Exception:
                         pass
             except Exception:
@@ -540,7 +580,11 @@ def delete_sem(department: str, sem: str):
 
 
 @app.post("/admin/departments/{department}/sems/{sem}/stores/create")
-def create_store_in_sem(department: str, sem: str, store_name: str = Form(...)):
+def create_store_in_sem(
+    department: str,
+    sem: str,
+    store_name: str = Form(...)
+):
     data = load_data()
 
     if department not in data.get("departments", {}):
@@ -554,17 +598,28 @@ def create_store_in_sem(department: str, sem: str, store_name: str = Form(...)):
     try:
         client = init_gemini_client(sem_key)
     except Exception as e:
-        return JSONResponse({"error": f"Invalid Gemini API key for sem: {e}"}, status_code=400)
+        return JSONResponse(
+            {"error": f"Invalid Gemini API key for sem: {e}"},
+            status_code=400
+        )
 
     try:
-        fs_store = client.file_search_stores.create(config={"display_name": store_name})
+        fs_store = client.file_search_stores.create(
+            config={"display_name": store_name}
+        )
         fs_store_name = getattr(fs_store, "name", None) or fs_store
     except Exception as e:
-        return JSONResponse({"error": f"Failed to create File Search store on Gemini: {e}"}, status_code=500)
+        return JSONResponse(
+            {"error": f"Failed to create File Search store on Gemini: {e}"},
+            status_code=500
+        )
 
     file_stores = data.setdefault("file_stores", {})
     if store_name in file_stores:
-        return JSONResponse({"error": "A local store with this name already exists"}, status_code=400)
+        return JSONResponse(
+            {"error": "A local store with this name already exists"},
+            status_code=400
+        )
 
     created_at = time.strftime("%Y-%m-%d %H:%M:%S")
     file_entry = {
@@ -623,7 +678,9 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
 
     removed_size = meta.get("total_size_bytes", 0)
     sem_meta = data["departments"][department]["sems"][sem]
-    sem_meta["total_size_bytes"] = max(0, sem_meta.get("total_size_bytes", 0) - removed_size)
+    sem_meta["total_size_bytes"] = max(
+        0, sem_meta.get("total_size_bytes", 0) - removed_size
+    )
 
     folder = UPLOAD_ROOT / department / sem / store_name
     if folder.exists():
@@ -643,14 +700,17 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
         "deleted_store": store_name,
         "removed_size_bytes": removed_size
     }
+
+
 # ---------------- Upload files with OCR → TXT and index into Gemini ----------------
+
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(
     department: str,
     sem: str,
     store_name: str,
     limit: Optional[bool] = Form(True),
-    file_type: str = Form(...),            # NEW: type of original file (pdf / image / docx)
+    file_type: str = Form(...),             # pdf / image / docx
     files: List[UploadFile] = File(...)
 ):
     """
@@ -658,7 +718,7 @@ async def upload_files_scoped(
     - Convert each original file (PDF / image / DOCX) into plain TEXT (.txt)
     - Upload ONLY the .txt file to Gemini File Search with mime_type = text/plain
     - Delete local temp files after upload
-    - Store only metadata (no persistent content)
+    - Store only metadata (no persistent content) for student privacy
     """
     data = load_data()
 
@@ -686,13 +746,14 @@ async def upload_files_scoped(
     temp_folder.mkdir(parents=True, exist_ok=True)
 
     results = []
-
     ftype = (file_type or "").lower().strip()
 
     for upload in files:
         original_filename = upload.filename or "file"
         base_clean = clean_filename(original_filename)
-        base_name_no_ext = base_clean.rsplit(".", 1)[0] if "." in base_clean else base_clean
+        base_name_no_ext = (
+            base_clean.rsplit(".", 1)[0] if "." in base_clean else base_clean
+        )
         txt_filename = base_name_no_ext + ".txt"
         temp_path = temp_folder / txt_filename
 
@@ -807,7 +868,7 @@ async def upload_files_scoped(
         entry = {
             "display_name": txt_filename,
             "original_filename": original_filename,
-            "size_bytes": original_size,   # track original size for usage
+            "size_bytes": original_size,  # track original size for usage
             "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "gemini_indexed": indexed_ok,
             "document_resource": document_resource,
@@ -833,7 +894,9 @@ async def upload_files_scoped(
         })
 
     store_total_bytes = store_meta.get("total_size_bytes", 0)
-    sem_total_bytes = data["departments"][department]["sems"][sem].get("total_size_bytes", 0)
+    sem_total_bytes = data["departments"][department]["sems"][sem].get(
+        "total_size_bytes", 0
+    )
 
     return {
         "success": True,
@@ -854,11 +917,19 @@ def list_files_in_store(department: str, sem: str, store_name: str):
         raise HTTPException(status_code=404, detail="Store not found in the sem")
     if store_name not in data.get("file_stores", {}):
         raise HTTPException(status_code=404, detail="Store metadata missing")
-    return {"success": True, "files": data["file_stores"][store_name].get("files", [])}
+    return {
+        "success": True,
+        "files": data["file_stores"][store_name].get("files", [])
+    }
 
 
 @app.delete("/departments/{department}/sems/{sem}/stores/{store_name}/documents/{document_id}")
-def delete_document_scoped(department: str, sem: str, store_name: str, document_id: str):
+def delete_document_scoped(
+    department: str,
+    sem: str,
+    store_name: str,
+    document_id: str
+):
     data = load_data()
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
@@ -878,9 +949,15 @@ def delete_document_scoped(department: str, sem: str, store_name: str, document_
     try:
         resp = requests.delete(url, params=params, timeout=15)
     except Exception as e:
-        return JSONResponse({"success": False, "error": f"REST request failed: {e}"}, status_code=500)
+        return JSONResponse(
+            {"success": False, "error": f"REST request failed: {e}"},
+            status_code=500
+        )
     if resp.status_code not in (200, 204):
-        return JSONResponse({"success": False, "error": f"Gemini REST DELETE failed: {resp.text}"}, status_code=resp.status_code)
+        return JSONResponse(
+            {"success": False, "error": f"Gemini REST DELETE failed: {resp.text}"},
+            status_code=resp.status_code
+        )
 
     removed_size = 0
     new_files = []
@@ -890,9 +967,13 @@ def delete_document_scoped(department: str, sem: str, store_name: str, document_
             continue
         new_files.append(f)
     meta["files"] = new_files
-    meta["total_size_bytes"] = max(0, meta.get("total_size_bytes", 0) - removed_size)
+    meta["total_size_bytes"] = max(
+        0, meta.get("total_size_bytes", 0) - removed_size
+    )
     sem_meta = data["departments"][department]["sems"][sem]
-    sem_meta["total_size_bytes"] = max(0, sem_meta.get("total_size_bytes", 0) - removed_size)
+    sem_meta["total_size_bytes"] = max(
+        0, sem_meta.get("total_size_bytes", 0) - removed_size
+    )
     data["file_stores"][store_name] = meta
     save_data(data)
     return {
@@ -957,14 +1038,18 @@ except Exception as e:
         e,
         UPLOAD_ROOT,
     )
-# ---------------- Gemini extraction / selection / RAG helpers ----------------
+# ============================
+# smartbvb.py  (PART 3 / 3)
+# ============================
 
+# ---------------- Gemini extraction / selection / RAG helpers ----------------
 
 def _extract_system_and_query_sync(client, raw_text: str) -> str:
     system_prompt = (
-        "You are a parser. Extract ONLY two things from the user's message as valid JSON:\n"
-        "1) system_prompt: any instructions that tell the assistant HOW to behave (tone/style/format).\n"
-        "2) user_query: the actual question to be answered.\n"
+        "You are a parser. Extract ONLY two things from the student's message as valid JSON:\n"
+        "1) system_prompt: any instructions that tell the assistant HOW to behave "
+        "(tone/style/format/constraints).\n"
+        "2) user_query: the actual academic question to be answered.\n"
         'Return EXACT JSON: {"system_prompt": "...", "user_query": "..."}.\n'
     )
     model = "gemini-2.5-flash"
@@ -1001,25 +1086,53 @@ def _parse_json_loose(raw: str) -> Dict:
 
 
 def _call_gemini_store_selector_sync(client, stores: List[str], question: str) -> str:
+    """
+    Ask Gemini to pick which stores (subjects/chapters) are relevant for this student's question.
+    It can also split the question per store, and mark any parts that cannot be answered.
+    """
     model = "gemini-2.5-flash"
     system_prompt = f"""
-You classify a student's academic question to the relevant study-material stores.
+You are an academic router that reads a student's question and decides which study-material
+stores are relevant.
+
+Each store typically corresponds to a subject, semester, or carefully grouped notes.
+
+Available stores: {stores}
+
+The student question is: "{question}"
 
 You must:
-- Identify which store contains the correct chapter/unit/module.
-- If user asks “solutions for review questions of chapter X”, find stores where chapter X appears.
-- Return split questions per store, where each question isolates content from that chapter.
-- If nothing matches, return unanswered.
-.
-Available stores: {stores}
-User question: "{question}"
-Return valid JSON exactly in this format:
+
+1. Identify which stores are relevant based on:
+   - chapter names (e.g., "Chapter 1", "Unit 2", "Module 3")
+   - subject names (e.g., "OS", "DBMS", "CN")
+   - hints like "according to class notes", "as per PPT", etc.
+
+2. If the question is broad (e.g., “Explain entire Unit 1” or “give all review question solutions for Chapter 1”),
+   select every store that might contain that chapter/unit.
+
+3. For each selected store, create a focused question that includes:
+   - the chapter/unit/module name (if mentioned)
+   - the student's intent (explain, summarize, list definitions, write short notes, solutions, etc.)
+
+Return VALID JSON in this EXACT structure:
+
 {{
-  "stores": ["store1", "store2"],
-  "split_questions": {{ "store1": "...", "store2": "..." }},
-  "unanswered": [ {{ "text": "...", "reason": "..." }} ]
+  "stores": ["store_name_1", "store_name_2"],
+  "split_questions": {{
+      "store_name_1": "focused question for this store",
+      "store_name_2": "another focused question"
+  }},
+  "unanswered": [
+      {{
+        "text": "any remaining part of the query that no store can handle",
+        "reason": "why it cannot be answered from given stores"
+      }}
+  ]
 }}
-If nothing matches, return stores: [] and put the original question into 'unanswered'.
+
+If none of the stores match, return "stores": [] and in "unanswered" put the original question
+with a helpful reason.
 """
     response = client.models.generate_content(
         model=model,
@@ -1069,23 +1182,52 @@ async def _call_gemini_for_store_selection(
 
 def data_store_name_for(local_store_name: str) -> str:
     d = load_data()
-    return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
+    return d.get("file_stores", {}).get(local_store_name, {}).get(
+        "file_search_store_name", ""
+    )
+
+
 async def _call_rag_for_store(
     sem_key: str,
     store: str,
     question: str,
     system_prompt: Optional[str] = None
 ) -> Dict:
+    """
+    Core RAG call for one store.
+
+    For university students:
+    - Use File Search documents as *grounding*.
+    - BUT Gemini is allowed to extend with its own reasoning to explain concepts,
+      summarize chapters, and generate solutions to review questions.
+    """
     if genai is None:
         return {"error": True, "detail": "Gemini SDK missing"}
     loop = asyncio.get_running_loop()
 
     def _sync_call():
         client = init_gemini_client(sem_key)
+
+        # ---- NEW ACADEMIC DEFAULT PROMPT ----
         cfg_prompt = system_prompt or (
-            "You are an academic assistant helping students understand study materials. You can combine the retrieved documents with your own reasoning.  Rules: 1. Use the retrieved content as reference and grounding. 2. Generate complete explanations, definitions, and solutions. 3. If the user asks for "solutions", create detailed step-by-step answers using the notes as base material. 4. If questions appear in the retrieved text (like "Review Questions"), retrieve ALL of them and generate answers for each. 5. If multiple stores have relevant chapters, merge knowledge. 6. Keep answers structured, clear, and in simple student-friendly language. 7. If some information is missing, still try to answer with your own reasoning but mention what was missing. 8. Never mention File Search or implementation details. "
-            "If info is missing, say: 'Sorry, no information available.'"
+            "You are an academic assistant helping university students with notes, PPTs, "
+            "lesson plans, and review questions.\n"
+            "Use the retrieved File Search documents as your *main reference context*, "
+            "but you ARE allowed to extend with your own reasoning and knowledge.\n"
+            "\n"
+            "Rules:\n"
+            "1. If the student asks for 'solutions', 'answers', or 'explain/review questions',\n"
+            "   you MUST generate clear, step-by-step solutions for each question found in the context.\n"
+            "2. If a chapter/unit/module is mentioned (e.g., 'Chapter 1', 'Unit 2'),\n"
+            "   focus on that part of the syllabus and collect all relevant information.\n"
+            "3. Combine content from multiple retrieved chunks logically.\n"
+            "4. Use simple, student-friendly language and well-structured formatting\n"
+            "   (headings, bullet points, numbered steps) whenever it helps understanding.\n"
+            "5. If some specific detail is missing from the notes, still try to answer using your\n"
+            "   own knowledge, but clearly mention that the detail is not explicitly present in the material.\n"
+            "6. NEVER mention File Search, embeddings, or any internal implementation details.\n"
         )
+
         file_search_tool = types.Tool(
             file_search=types.FileSearch(
                 file_search_store_names=[data_store_name_for(store)]
@@ -1130,6 +1272,11 @@ def _merge_answers_apply_system(
     system_prompt: str,
     final_answers: List[Dict]
 ) -> str:
+    """
+    Merge per-store answers into one final student-friendly answer.
+
+    We keep the same 'no Q/A storage' guarantee (merge happens in-memory only).
+    """
     if not final_answers:
         return ""
     combined = []
@@ -1139,12 +1286,26 @@ def _merge_answers_apply_system(
         a = fa.get("answer") or ""
         combined.append(f"STORE: {s}\nQUESTION: {q}\nANSWER: {a}\n---")
     combined_text = "\n".join(combined)
+
     merge_instr = (
-        "You are an assistant that MUST produce a single final answer formatted using the following system instructions:\n"
-        f"{system_prompt}\n\n"
-        "You are an academic assistant. Combine answers from multiple stores into one final structured answer.- Remove duplicate information- Maintain correctness- If the user asked for solutions, combine all solutions- Produce a clean, organized answer suitable for exam preparation"
-        f"CONTEXT: \n{combined_text}\n"
+        "You are an academic assistant combining answers from multiple study-material stores "
+        "into ONE final response for a student.\n"
+        "\n"
+        "System instructions for the final answer (from the user or application):\n"
+        f"{system_prompt}\n"
+        "\n"
+        "You are given answers from multiple stores below. Your job:\n"
+        "1. Merge them into a single coherent explanation.\n"
+        "2. Remove duplicates and contradictions.\n"
+        "3. Make the final answer well-structured and exam-friendly.\n"
+        "4. If the question involved 'review questions' or 'chapter solutions',\n"
+        "   ensure that all solutions are presented in an organized way (Q1, Q2, etc.).\n"
+        "5. If some information is clearly missing, briefly mention that.\n"
+        "6. Do NOT mention stores, File Search, or internal implementation details.\n"
+        "\n"
+        "Return ONLY the final merged answer text, nothing else.\n"
     )
+
     try:
         client = init_gemini_client(sem_key)
         response = client.models.generate_content(
@@ -1166,13 +1327,26 @@ def _merge_answers_apply_system(
             parts.append(f"{fa.get('store')}: {fa.get('answer')}")
         return "\n\n".join(parts)
 
+
 # =====================================================
 # ASK endpoint implementation (no session, no storing Q/A)
 # =====================================================
 
-
 @app.post("/departments/{department}/sems/{sem}/ask")
 async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
+    """
+    Main endpoint students will call.
+
+    Body: { "question": "..." }
+
+    Flow:
+    1. Extract (system_prompt, user_query) from the student's message.
+    2. Use Gemini to select which stores (subjects/chapters) are relevant.
+    3. Run RAG for each selected store.
+    4. If only one store and system_prompt exists, use that single RAG answer directly.
+    5. If multiple stores, merge answers and apply the system_prompt at final merge.
+    6. Return only final answer + minimal source texts (no Q/A stored).
+    """
     question = payload.get("question") if isinstance(payload, dict) else None
     if not question:
         raise HTTPException(status_code=400, detail="question required in request body")
@@ -1196,7 +1370,9 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         try:
             loop = asyncio.get_running_loop()
             client = await loop.run_in_executor(None, init_gemini_client, sem_key)
-            raw = await loop.run_in_executor(None, _extract_system_and_query_sync, client, question)
+            raw = await loop.run_in_executor(
+                None, _extract_system_and_query_sync, client, question
+            )
             parsed = _parse_json_loose(raw)
             system_prompt = parsed.get("system_prompt", "") or ""
             user_query = parsed.get("user_query", "") or question
@@ -1211,7 +1387,7 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
     unanswered_parts = selector.get("unanswered", []) or []
 
     if not selected_stores:
-        resp_text = "Sorry, no available service can answer this question."
+        resp_text = "Sorry, your question does not match any available study-material store."
         if unanswered_parts:
             extra = []
             for part in unanswered_parts:
@@ -1251,7 +1427,7 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
     all_sources = []
     for r in results:
         if r.get("error"):
-            answer_text = "Sorry, I could not retrieve information."
+            answer_text = "Sorry, I could not retrieve information from this store."
             sources = []
         else:
             answer_text = r.get("answer", "")
@@ -1261,6 +1437,8 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
             for c in chunks:
                 ctx = c.get("retrievedContext", {})
                 if ctx.get("text"):
+                    # We only keep minimal text as 'source' for transparency;
+                    # still we do NOT store question/answer history anywhere.
                     sources.append(ctx["text"])
         final_answers.append({
             "store": r.get("store"),
@@ -1277,11 +1455,13 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         if system_prompt.strip():
             merged_text = _merge_answers_apply_system(sem_key, system_prompt, final_answers)
         else:
+            # No explicit system prompt: just combine store answers plainly but still student-friendly.
             parts = []
             for fa in final_answers:
                 parts.append(f"**{fa['store']}**:\n{fa['answer']}")
             merged_text = "\n\n".join(parts)
 
+    # If there were parts that no store could answer, append that info.
     if unanswered_parts:
         extra_lines = []
         for part in unanswered_parts:
@@ -1295,7 +1475,8 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
                 extra_lines.append(f'- "{txt}"')
         if extra_lines:
             merged_text += (
-                "\n\nThe following parts of your question could not be answered by any available service department:\n"
+                "\n\nThe following parts of your question could not be fully answered "
+                "from the available notes/stores:\n"
                 + "\n".join(extra_lines)
             )
 
@@ -1303,12 +1484,13 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         "success": True,
         "response": merged_text,
         "stores_used": selected_stores,
-        "sources": all_sources[:1],
+        "sources": all_sources[:1],  # keep just 1 minimal source snippet
         "unanswered_parts": unanswered_parts
     }
 
 
 # ---------------- Run guidance ----------------
+
 if __name__ == "__main__":
     print(
         "This module is intended to be run with Uvicorn, e.g.:\n"
