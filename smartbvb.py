@@ -13,8 +13,8 @@ Important constraints per user request:
 - DO NOT store question/answer text anywhere (only metadata about stores/files is kept)
 - CORS enabled for testing: allows calls from anywhere
 """
-from PIL import Image  # kept from previous version (not used now, but left as-is)
-import pandas as pd    # kept from previous version
+from PIL import Image  # kept from previous version
+import pandas as pd
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
@@ -32,6 +32,12 @@ import logging
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import mimetypes  # MIME detection
+import tempfile
+
+# OCR-related imports
+import pytesseract
+import fitz  # PyMuPDF
+import docx2txt
 
 logger = logging.getLogger("smartbvb")
 logging.basicConfig(level=logging.INFO)
@@ -275,6 +281,60 @@ def normalize_mime_type(mime: Optional[str]) -> Optional[str]:
         return None
 
     return mime
+
+# ---------------- OCR HELPERS (PDF / IMAGE / DOCX → TEXT) ----------------
+
+
+async def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """
+    Convert a PDF (bytes) into text using PyMuPDF + Tesseract.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_bytes)
+        pdf_path = tmp.name
+
+    pdf = fitz.open(pdf_path)
+    text_output = []
+
+    for page_num in range(len(pdf)):
+        page = pdf.load_page(page_num)
+        pix = page.get_pixmap()
+        img_bytes = pix.tobytes("png")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as img_tmp:
+            img_tmp.write(img_bytes)
+            img_path = img_tmp.name
+
+        image = Image.open(img_path)
+        extracted_text = pytesseract.image_to_string(image)
+        text_output.append(f"--- PAGE {page_num + 1} ---\n{extracted_text}")
+
+    return "\n".join(text_output)
+
+
+async def extract_text_from_image(file_bytes: bytes) -> str:
+    """
+    Convert an image (bytes) into text using Tesseract.
+    """
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file_bytes)
+        image_path = tmp.name
+
+    image = Image.open(image_path)
+    text = pytesseract.image_to_string(image)
+    return text
+
+
+async def extract_text_from_docx(file_bytes: bytes) -> str:
+    """
+    Convert a DOCX (bytes) into plain text using docx2txt.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(file_bytes)
+        docx_path = tmp.name
+
+    extracted_text = docx2txt.process(docx_path)
+    return extracted_text
 
 # ---------------- Gemini helpers (basic) ----------------
 
@@ -583,23 +643,22 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
         "deleted_store": store_name,
         "removed_size_bytes": removed_size
     }
-# ---------------- UPDATED: upload files AS-IS with correct MIME ----------------
+# ---------------- Upload files with OCR → TXT and index into Gemini ----------------
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(
     department: str,
     sem: str,
     store_name: str,
     limit: Optional[bool] = Form(True),
+    file_type: str = Form(...),            # NEW: type of original file (pdf / image / docx)
     files: List[UploadFile] = File(...)
 ):
     """
-    FINAL FIXED VERSION:
-    - Saves uploaded file in ONE READ (no chunk corruption)
-    - Seeks to start before reading (safety)
-    - Provides correct MIME type to Gemini (content_type + mimetypes + normalization)
-    - No PDF conversion
-    - Supports all file types allowed by Gemini File Search
-    - Deletes local temp file after upload (only metadata kept)
+    Upload files into a store, but:
+    - Convert each original file (PDF / image / DOCX) into plain TEXT (.txt)
+    - Upload ONLY the .txt file to Gemini File Search with mime_type = text/plain
+    - Delete local temp files after upload
+    - Store only metadata (no persistent content)
     """
     data = load_data()
 
@@ -628,59 +687,85 @@ async def upload_files_scoped(
 
     results = []
 
+    ftype = (file_type or "").lower().strip()
+
     for upload in files:
         original_filename = upload.filename or "file"
-        filename = clean_filename(original_filename)
-        temp_path = temp_folder / filename
+        base_clean = clean_filename(original_filename)
+        base_name_no_ext = base_clean.rsplit(".", 1)[0] if "." in base_clean else base_clean
+        txt_filename = base_name_no_ext + ".txt"
+        temp_path = temp_folder / txt_filename
 
-        # ---- ensure pointer at start, then READ ONCE ----
+        # ---- ensure pointer at start, then READ ORIGINAL BYTES ONCE ----
         try:
             await upload.seek(0)
-            content = await upload.read()
-            size = len(content)
+            original_bytes = await upload.read()
+            original_size = len(original_bytes)
 
-            if limit and size > MAX_FILE_BYTES:
+            # check limit using original file size
+            if limit and original_size > MAX_FILE_BYTES:
                 results.append({
-                    "filename": filename,
+                    "filename": original_filename,
                     "uploaded": False,
                     "indexed": False,
                     "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes."
                 })
                 continue
 
-            with open(temp_path, "wb") as f:
-                f.write(content)
+            # -----------------------------
+            # Convert original file → TEXT based on file_type
+            # -----------------------------
+            if ftype == "pdf":
+                text_content = await extract_text_from_pdf(original_bytes)
+            elif ftype == "image":
+                text_content = await extract_text_from_image(original_bytes)
+            elif ftype == "docx":
+                text_content = await extract_text_from_docx(original_bytes)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid file_type. Expected one of: pdf, image, docx"
+                )
 
+            # Save TEXT as .txt file
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    f.write(text_content or "")
+                size = temp_path.stat().st_size
+            except Exception as e:
+                results.append({
+                    "filename": original_filename,
+                    "uploaded": False,
+                    "indexed": False,
+                    "reason": f"Failed to save local TXT file: {e}"
+                })
+                continue
+
+        except HTTPException:
+            # re-raise HTTPException directly
+            raise
         except Exception as e:
             results.append({
-                "filename": filename,
+                "filename": original_filename,
                 "uploaded": False,
                 "indexed": False,
-                "reason": f"Failed to save local file: {e}"
+                "reason": f"Failed to process file: {e}"
             })
             continue
 
         # ---------------------------
-        # Upload AS-IS to Gemini File Search WITH SAFE MIME TYPE
+        # Upload TXT file to Gemini File Search WITH mime_type = text/plain
         # ---------------------------
         document_resource = None
         document_id = None
         indexed_ok = False
         gemini_error = None
 
-        # robust + safe MIME handling
-        mime = upload.content_type or ""
-        if not mime or mime == "application/octet-stream":
-            mime = guess_mime_type(filename)
-
-        mime = normalize_mime_type(mime)
-
+        mime = "text/plain"
         upload_config: Dict[str, Any] = {
-            "display_name": filename
+            "display_name": txt_filename,
+            "mime_type": mime
         }
-        # Only include mime_type if valid
-        if mime:
-            upload_config["mime_type"] = mime
 
         try:
             op = client.file_search_stores.upload_to_file_search_store(
@@ -701,7 +786,7 @@ async def upload_files_scoped(
             if not document_resource:
                 docs = rest_list_documents_for_store(fs_store_name, sem_key)
                 for d in docs:
-                    if d.get("displayName") == filename:
+                    if d.get("displayName") == txt_filename:
                         document_resource = d.get("name")
                         break
 
@@ -712,7 +797,7 @@ async def upload_files_scoped(
         except Exception as e:
             gemini_error = str(e)
 
-        # Delete temp file after upload (you wanted no file persistence after indexing)
+        # Delete temp TXT file after upload
         try:
             os.remove(temp_path)
         except Exception:
@@ -720,28 +805,31 @@ async def upload_files_scoped(
 
         # Save metadata only (no file content)
         entry = {
-            "display_name": filename,
-            "size_bytes": size,
+            "display_name": txt_filename,
+            "original_filename": original_filename,
+            "size_bytes": original_size,   # track original size for usage
             "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "gemini_indexed": indexed_ok,
             "document_resource": document_resource,
             "document_id": document_id,
-            "gemini_error": gemini_error
+            "gemini_error": gemini_error,
+            "file_type": ftype
         }
 
         store_meta.setdefault("files", []).append(entry)
-        store_meta["total_size_bytes"] += size
-        data["departments"][department]["sems"][sem]["total_size_bytes"] += size
+        store_meta["total_size_bytes"] += original_size
+        data["departments"][department]["sems"][sem]["total_size_bytes"] += original_size
         save_data(data)
 
         results.append({
-            "filename": filename,
+            "filename": original_filename,
+            "txt_filename": txt_filename,
             "uploaded": True,
             "indexed": indexed_ok,
             "document_resource": document_resource,
             "document_id": document_id,
             "gemini_error": gemini_error,
-            "size_bytes": size
+            "original_size_bytes": original_size
         })
 
     store_total_bytes = store_meta.get("total_size_bytes", 0)
@@ -975,8 +1063,6 @@ async def _call_gemini_for_store_selection(
 def data_store_name_for(local_store_name: str) -> str:
     d = load_data()
     return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
-
-
 async def _call_rag_for_store(
     sem_key: str,
     store: str,
