@@ -1303,7 +1303,7 @@ def _merge_answers_apply_system(
         combined.append(f"STORE: {s}\nQUESTION: {q}\nANSWER: {a}\n---")
     combined_text = "\n".join(combined)
 
-   merge_instr = (
+    merge_instr = (
     "You are an academic assistant combining answers from multiple study-material stores "
     "into ONE final response for a student.\n"
     "\n"
@@ -1321,7 +1321,7 @@ def _merge_answers_apply_system(
     "6. Do NOT mention stores, File Search, or internal implementation details.\n"
     "\n"
     "Return ONLY the final merged answer text, nothing else.\n"
-)
+   )
 
 
     try:
