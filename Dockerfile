@@ -33,3 +33,4 @@ EXPOSE 8080
 
 # Use Cloud Run PORT
 CMD ["sh", "-c", "uvicorn smartbvb:app --host 0.0.0.0 --port ${PORT}"]
+#
