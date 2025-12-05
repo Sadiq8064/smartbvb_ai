@@ -1003,7 +1003,14 @@ def _parse_json_loose(raw: str) -> Dict:
 def _call_gemini_store_selector_sync(client, stores: List[str], question: str) -> str:
     model = "gemini-2.5-flash"
     system_prompt = f"""
-You are a classifier that analyzes a user's question and determines which stores (from the list below) can answer which parts of the question.
+You classify a student's academic question to the relevant study-material stores.
+
+You must:
+- Identify which store contains the correct chapter/unit/module.
+- If user asks “solutions for review questions of chapter X”, find stores where chapter X appears.
+- Return split questions per store, where each question isolates content from that chapter.
+- If nothing matches, return unanswered.
+.
 Available stores: {stores}
 User question: "{question}"
 Return valid JSON exactly in this format:
@@ -1076,7 +1083,7 @@ async def _call_rag_for_store(
     def _sync_call():
         client = init_gemini_client(sem_key)
         cfg_prompt = system_prompt or (
-            "You are a bot assisting citizens. Answer ONLY using File Search documents. "
+            "You are an academic assistant helping students understand study materials. You can combine the retrieved documents with your own reasoning.  Rules: 1. Use the retrieved content as reference and grounding. 2. Generate complete explanations, definitions, and solutions. 3. If the user asks for "solutions", create detailed step-by-step answers using the notes as base material. 4. If questions appear in the retrieved text (like "Review Questions"), retrieve ALL of them and generate answers for each. 5. If multiple stores have relevant chapters, merge knowledge. 6. Keep answers structured, clear, and in simple student-friendly language. 7. If some information is missing, still try to answer with your own reasoning but mention what was missing. 8. Never mention File Search or implementation details. "
             "If info is missing, say: 'Sorry, no information available.'"
         )
         file_search_tool = types.Tool(
@@ -1135,9 +1142,7 @@ def _merge_answers_apply_system(
     merge_instr = (
         "You are an assistant that MUST produce a single final answer formatted using the following system instructions:\n"
         f"{system_prompt}\n\n"
-        "You are given answers from multiple service stores below. Combine them into a single coherent answer, "
-        "avoid repetition, keep facts only, and follow the system instructions provided above. If some parts are missing, "
-        "mention that. Use the minimal necessary additional phrasing. Return only the final answer text.\n\n"
+        "You are an academic assistant. Combine answers from multiple stores into one final structured answer.- Remove duplicate information- Maintain correctness- If the user asked for solutions, combine all solutions- Produce a clean, organized answer suitable for exam preparation"
         f"CONTEXT: \n{combined_text}\n"
     )
     try:
