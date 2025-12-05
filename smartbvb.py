@@ -1303,24 +1303,26 @@ def _merge_answers_apply_system(
         combined.append(f"STORE: {s}\nQUESTION: {q}\nANSWER: {a}\n---")
     combined_text = "\n".join(combined)
 
-    merge_instr = (
-        "You are an academic assistant combining answers from multiple study-material stores "
-        "into ONE final response for a student.\n"
-        "\n"
-        "System instructions for the final answer (from the user or application):\n"
-        f"{system_prompt}\n"
-        "\n"
-        "You are given answers from multiple stores below. Your job:\n"
-        "1. Merge them into a single coherent explanation.\n"
-        "2. Remove duplicates and contradictions.\n"
-        "3. Make the final answer well-structured and exam-friendly.\n"
-        "4. If the question involved 'review questions' or 'chapter solutions',\n"
-        "   ensure that all solutions are presented in an organized way (Q1, Q2, etc.).\n"
-        ""5. If some minor detail is missing, you may mention it briefly, but you must still  provide a best-effort complete solution using your own knowledge.\n""
-        "6. Do NOT mention stores, File Search, or internal implementation details.\n"
-        "\n"
-        "Return ONLY the final merged answer text, nothing else.\n"
-    )
+   merge_instr = (
+    "You are an academic assistant combining answers from multiple study-material stores "
+    "into ONE final response for a student.\n"
+    "\n"
+    "System instructions for the final answer (from the user or application):\n"
+    f"{system_prompt}\n"
+    "\n"
+    "You are given answers from multiple stores below. Your job:\n"
+    "1. Merge them into a single coherent explanation.\n"
+    "2. Remove duplicates and contradictions.\n"
+    "3. Make the final answer well-structured and exam-friendly.\n"
+    "4. If the question involved 'review questions' or 'chapter solutions',\n"
+    "   ensure that all solutions are presented in an organized way (Q1, Q2, etc.).\n"
+    "5. If some minor detail is missing, you may mention it briefly, but you must still "
+    "   provide a best-effort complete solution using your own knowledge.\n"
+    "6. Do NOT mention stores, File Search, or internal implementation details.\n"
+    "\n"
+    "Return ONLY the final merged answer text, nothing else.\n"
+)
+
 
     try:
         client = init_gemini_client(sem_key)
