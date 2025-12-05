@@ -1,4 +1,3 @@
-
 """
 FastAPI backend (smartbvb) — clean production/testing-ready single-file API.
 
@@ -32,7 +31,7 @@ import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from pathlib import Path
-import mimetypes  # << FIX 2 helper (MIME detection)
+import mimetypes  # MIME detection
 
 logger = logging.getLogger("smartbvb")
 logging.basicConfig(level=logging.INFO)
@@ -246,7 +245,7 @@ def clean_filename(name: str, max_len: int = 180) -> str:
 
 def guess_mime_type(filename: str, fallback: str = "application/octet-stream") -> str:
     """
-    FIX 2 helper: robust MIME type detection.
+    Robust MIME type detection.
     - Try Python's mimetypes
     - Fallback to generic octet-stream (Gemini will still try for many)
     """
@@ -255,7 +254,29 @@ def guess_mime_type(filename: str, fallback: str = "application/octet-stream") -
         return mime
     return fallback
 
-# ---------------- Gemini helpers ----------------
+
+def normalize_mime_type(mime: Optional[str]) -> Optional[str]:
+    """
+    Ensure MIME type is clean 'type/subtype'.
+    - Remove parameters like '; charset=binary'
+    - Validate correct structure
+    """
+    if not mime:
+        return None
+
+    mime = mime.strip()
+
+    # Remove anything after ';'
+    if ";" in mime:
+        mime = mime.split(";", 1)[0].strip()
+
+    # Must contain '/'
+    if "/" not in mime:
+        return None
+
+    return mime
+
+# ---------------- Gemini helpers (basic) ----------------
 
 
 def init_gemini_client(api_key: str):
@@ -300,7 +321,7 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
 def admin_login(email: str = Form(...), password: str = Form(...)):
     """
     Simple admin login for development use. Returns a success message.
-    (No session/token management — removed per request.)
+    (No session/token management — per requirement.)
     """
     if email != ADMIN_EMAIL or password != ADMIN_PASSWORD:
         return JSONResponse({"error": "Invalid credentials"}, status_code=401)
@@ -510,7 +531,7 @@ def list_stores_in_sem(department: str, sem: str):
     if department not in data.get("departments", {}):
         raise HTTPException(status_code=404, detail="Department not found")
     if sem not in data["departments"][department].get("sems", {}):
-        raise HTTPException(statuscode=404, detail="Sem not found")
+        raise HTTPException(status_code=404, detail="Sem not found")
     stores = data["departments"][department]["sems"][sem].get("stores", [])
     file_stores = data.get("file_stores", {})
     result = [file_stores.get(s) for s in stores if s in file_stores]
@@ -562,8 +583,6 @@ def delete_store_scoped(department: str, sem: str, store_name: str):
         "deleted_store": store_name,
         "removed_size_bytes": removed_size
     }
-
-
 # ---------------- UPDATED: upload files AS-IS with correct MIME ----------------
 @app.post("/departments/{department}/sems/{sem}/stores/{store_name}/upload")
 async def upload_files_scoped(
@@ -577,9 +596,10 @@ async def upload_files_scoped(
     FINAL FIXED VERSION:
     - Saves uploaded file in ONE READ (no chunk corruption)
     - Seeks to start before reading (safety)
-    - Provides correct MIME type to Gemini (content_type + mimetypes)
+    - Provides correct MIME type to Gemini (content_type + mimetypes + normalization)
     - No PDF conversion
     - Supports all file types allowed by Gemini File Search
+    - Deletes local temp file after upload (only metadata kept)
     """
     data = load_data()
 
@@ -613,7 +633,7 @@ async def upload_files_scoped(
         filename = clean_filename(original_filename)
         temp_path = temp_folder / filename
 
-        # ---- FIX 1: ensure pointer at start, then READ ONCE ----
+        # ---- ensure pointer at start, then READ ONCE ----
         try:
             await upload.seek(0)
             content = await upload.read()
@@ -641,26 +661,32 @@ async def upload_files_scoped(
             continue
 
         # ---------------------------
-        # Upload AS-IS to Gemini File Search WITH MIME TYPE
+        # Upload AS-IS to Gemini File Search WITH SAFE MIME TYPE
         # ---------------------------
         document_resource = None
         document_id = None
         indexed_ok = False
         gemini_error = None
 
-        # FIX 2: robust MIME
+        # robust + safe MIME handling
         mime = upload.content_type or ""
         if not mime or mime == "application/octet-stream":
             mime = guess_mime_type(filename)
+
+        mime = normalize_mime_type(mime)
+
+        upload_config: Dict[str, Any] = {
+            "display_name": filename
+        }
+        # Only include mime_type if valid
+        if mime:
+            upload_config["mime_type"] = mime
 
         try:
             op = client.file_search_stores.upload_to_file_search_store(
                 file=str(temp_path),
                 file_search_store_name=fs_store_name,
-                config={
-                    "display_name": filename,
-                    "mime_type": mime
-                }
+                config=upload_config
             )
 
             op = wait_for_operation(client, op)
@@ -686,13 +712,13 @@ async def upload_files_scoped(
         except Exception as e:
             gemini_error = str(e)
 
-        # Delete temp file after upload
+        # Delete temp file after upload (you wanted no file persistence after indexing)
         try:
             os.remove(temp_path)
         except Exception:
             pass
 
-        # Save metadata
+        # Save metadata only (no file content)
         entry = {
             "display_name": filename,
             "size_bytes": size,
@@ -825,6 +851,24 @@ def department_usage(department: str):
         "sems": sems_sizes
     }
 
+
+@app.get("/health")
+def health_check():
+    return {"success": True, "status": "ok"}
+
+
+# ---------------- Startup quick writable-check ----------------
+try:
+    test_path = UPLOAD_ROOT / ".write_test"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text("ok")
+    test_path.unlink()
+except Exception as e:
+    logger.error(
+        "Upload root not writable or cannot create test file: %s (UPLOAD_ROOT=%s)",
+        e,
+        UPLOAD_ROOT,
+    )
 # ---------------- Gemini extraction / selection / RAG helpers ----------------
 
 
@@ -833,7 +877,7 @@ def _extract_system_and_query_sync(client, raw_text: str) -> str:
         "You are a parser. Extract ONLY two things from the user's message as valid JSON:\n"
         "1) system_prompt: any instructions that tell the assistant HOW to behave (tone/style/format).\n"
         "2) user_query: the actual question to be answered.\n"
-        "Return EXACT JSON: {\"system_prompt\": \"...\", \"user_query\": \"...\"}."
+        'Return EXACT JSON: {"system_prompt": "...", "user_query": "..."}.\n'
     )
     model = "gemini-2.5-flash"
     response = client.models.generate_content(
@@ -880,7 +924,7 @@ Return valid JSON exactly in this format:
   "split_questions": {{ "store1": "...", "store2": "..." }},
   "unanswered": [ {{ "text": "...", "reason": "..." }} ]
 }}
-If nothing matches, return stores: [] and put original question into unanswered.
+If nothing matches, return stores: [] and put the original question into 'unanswered'.
 """
     response = client.models.generate_content(
         model=model,
@@ -928,6 +972,11 @@ async def _call_gemini_for_store_selection(
         return {"stores": stores, "split_questions": {}, "unanswered": []}
 
 
+def data_store_name_for(local_store_name: str) -> str:
+    d = load_data()
+    return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
+
+
 async def _call_rag_for_store(
     sem_key: str,
     store: str,
@@ -942,7 +991,7 @@ async def _call_rag_for_store(
         client = init_gemini_client(sem_key)
         cfg_prompt = system_prompt or (
             "You are a bot assisting citizens. Answer ONLY using File Search documents. "
-            "If info missing, say: 'Sorry, no information available.'"
+            "If info is missing, say: 'Sorry, no information available.'"
         )
         file_search_tool = types.Tool(
             file_search=types.FileSearch(
@@ -981,11 +1030,6 @@ async def _call_rag_for_store(
             }
 
     return await loop.run_in_executor(None, _sync_call)
-
-
-def data_store_name_for(local_store_name: str) -> str:
-    d = load_data()
-    return d.get("file_stores", {}).get(local_store_name, {}).get("file_search_store_name", "")
 
 
 def _merge_answers_apply_system(
@@ -1083,7 +1127,7 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
                 txt = part.get("text") or ""
                 reason = part.get("reason") or ""
                 if txt:
-                    extra.append(f"- \"{txt}\" ({reason})" if reason else f"- \"{txt}\"")
+                    extra.append(f'- "{txt}" ({reason})' if reason else f'- "{txt}"')
             if extra:
                 resp_text += "\n\nDetails:\n" + "\n".join(extra)
         return {
@@ -1155,9 +1199,9 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
             if not txt:
                 continue
             if reason:
-                extra_lines.append(f"- \"{txt}\" ({reason})")
+                extra_lines.append(f'- "{txt}" ({reason})')
             else:
-                extra_lines.append(f"- \"{txt}\"")
+                extra_lines.append(f'- "{txt}"')
         if extra_lines:
             merged_text += (
                 "\n\nThe following parts of your question could not be answered by any available service department:\n"
@@ -1172,25 +1216,6 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         "unanswered_parts": unanswered_parts
     }
 
-# ---------------- Misc endpoints ----------------
-
-
-@app.get("/health")
-def health_check():
-    return {"success": True, "status": "ok"}
-
-# ---------------- Startup quick writable-check ----------------
-try:
-    test_path = UPLOAD_ROOT / ".write_test"
-    test_path.parent.mkdir(parents=True, exist_ok=True)
-    test_path.write_text("ok")
-    test_path.unlink()
-except Exception as e:
-    logger.error(
-        "Upload root not writable or cannot create test file: %s (UPLOAD_ROOT=%s)",
-        e,
-        UPLOAD_ROOT,
-    )
 
 # ---------------- Run guidance ----------------
 if __name__ == "__main__":
