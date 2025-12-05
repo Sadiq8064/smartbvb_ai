@@ -1197,9 +1197,9 @@ async def _call_rag_for_store(
     Core RAG call for one store.
 
     For university students:
-    - Use File Search documents as *grounding*.
-    - BUT Gemini is allowed to extend with its own reasoning to explain concepts,
-      summarize chapters, and generate solutions to review questions.
+    - Use File Search documents as *grounding* (to see syllabus, chapter names, question papers, etc.)
+    - BUT Gemini is REQUIRED to generate explanations and solutions even if the notes
+      only contain questions and not answers.
     """
     if genai is None:
         return {"error": True, "detail": "Gemini SDK missing"}
@@ -1208,24 +1208,38 @@ async def _call_rag_for_store(
     def _sync_call():
         client = init_gemini_client(sem_key)
 
-        # ---- NEW ACADEMIC DEFAULT PROMPT ----
+        # ---- STRONG ACADEMIC DEFAULT PROMPT (ALWAYS SOLVE) ----
         cfg_prompt = system_prompt or (
             "You are an academic assistant helping university students with notes, PPTs, "
             "lesson plans, and review questions.\n"
-            "Use the retrieved File Search documents as your *main reference context*, "
-            "but you ARE allowed to extend with your own reasoning and knowledge.\n"
             "\n"
-            "Rules:\n"
-            "1. If the student asks for 'solutions', 'answers', or 'explain/review questions',\n"
-            "   you MUST generate clear, step-by-step solutions for each question found in the context.\n"
-            "2. If a chapter/unit/module is mentioned (e.g., 'Chapter 1', 'Unit 2'),\n"
-            "   focus on that part of the syllabus and collect all relevant information.\n"
-            "3. Combine content from multiple retrieved chunks logically.\n"
-            "4. Use simple, student-friendly language and well-structured formatting\n"
-            "   (headings, bullet points, numbered steps) whenever it helps understanding.\n"
-            "5. If some specific detail is missing from the notes, still try to answer using your\n"
-            "   own knowledge, but clearly mention that the detail is not explicitly present in the material.\n"
-            "6. NEVER mention File Search, embeddings, or any internal implementation details.\n"
+            "You are given context from File Search which may include:\n"
+            "- Syllabus, chapter titles, unit names\n"
+            "- Question papers (like ESA / internal exams)\n"
+            "- Lesson plans, PPT outlines, handwritten notes, etc.\n"
+            "\n"
+            "IMPORTANT:\n"
+            "1. The retrieved documents might contain ONLY QUESTIONS and no solutions.\n"
+            "2. Even if the solutions are NOT present in the documents, you MUST still\n"
+            "   generate complete, correct solutions using your own reasoning and knowledge.\n"
+            "3. Treat the retrieved questions as the official exam questions and answer them\n"
+            "   fully, step-by-step, as if you are writing model answers for the exam.\n"
+            "4. Use the context mainly to understand the subject, chapter, unit, and style,\n"
+            "   but DO NOT restrict yourself to only what is explicitly written there.\n"
+            "\n"
+            "Answering rules:\n"
+            "- If the student asks for 'solutions', 'answers', 'ESA questions', 'model answers',\n"
+            "  consider that they want DETAILED solutions for all the exam questions you can see\n"
+            "  in the retrieved context.\n"
+            "- Write answers in clear, student-friendly language.\n"
+            "- Use headings, bullet points, and numbered steps where helpful.\n"
+            "- Prefer depth and clarity over being brief, since students will use this for exam preparation.\n"
+            "- NEVER reply that 'solutions are not available in the document'. If the question\n"
+            "  text is visible, that alone is enough for you to generate a solution.\n"
+            "- Only if the question itself is completely missing or unclear should you mention\n"
+            "  that you cannot answer a specific part.\n"
+            "\n"
+            "Do NOT mention File Search, embeddings, or internal implementation details.\n"
         )
 
         file_search_tool = types.Tool(
@@ -1233,6 +1247,7 @@ async def _call_rag_for_store(
                 file_search_store_names=[data_store_name_for(store)]
             )
         )
+
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -1265,6 +1280,7 @@ async def _call_rag_for_store(
             }
 
     return await loop.run_in_executor(None, _sync_call)
+
 
 
 def _merge_answers_apply_system(
@@ -1300,7 +1316,7 @@ def _merge_answers_apply_system(
         "3. Make the final answer well-structured and exam-friendly.\n"
         "4. If the question involved 'review questions' or 'chapter solutions',\n"
         "   ensure that all solutions are presented in an organized way (Q1, Q2, etc.).\n"
-        "5. If some information is clearly missing, briefly mention that.\n"
+        ""5. If some minor detail is missing, you may mention it briefly, but you must still  provide a best-effort complete solution using your own knowledge.\n""
         "6. Do NOT mention stores, File Search, or internal implementation details.\n"
         "\n"
         "Return ONLY the final merged answer text, nothing else.\n"
