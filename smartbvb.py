@@ -1,5 +1,5 @@
 # ============================
-# smartbvb.py  (PART 1 / 3)
+# smartbvb.py  (PART 1 / 2)
 # ============================
 """
 FastAPI backend (smartbvb) — clean production/testing-ready single-file API.
@@ -10,10 +10,8 @@ University use-case:
 - Each Sem stores a Gemini API key (used for all operations under that sem)
 - Upload / delete files (PDF / images / DOCX) → OCR → text → index into Gemini File Search
 - ASK endpoint:
-    - Extract system_prompt + user_query from the student's message
-    - Select relevant stores via Gemini
-    - Run RAG per-store (File Search)
-    - Merge answers, applying the system_prompt only at final merge
+    - Student sends: question + list of store names + optional system_prompt
+    - We call Gemini File Search directly on those stores (NO prediction / routing)
 
 Important constraints:
 
@@ -534,7 +532,7 @@ def list_sems(department: str):
         "sems": list(data["departments"][department].get("sems", {}).keys())
     }
 # ============================
-# smartbvb.py  (PART 2 / 3)
+# smartbvb.py  (PART 2 / 2)
 # ============================
 
 @app.delete("/admin/departments/{department}/sems/{sem}")
@@ -1038,336 +1036,48 @@ except Exception as e:
         e,
         UPLOAD_ROOT,
     )
-# ============================
-# smartbvb.py  (PART 3 / 3)
-# ============================
-
-# ---------------- Gemini extraction / selection / RAG helpers ----------------
-
-def _extract_system_and_query_sync(client, raw_text: str) -> str:
-    system_prompt = (
-        "You are a parser. Extract ONLY two things from the student's message as valid JSON:\n"
-        "1) system_prompt: any instructions that tell the assistant HOW to behave "
-        "(tone/style/format/constraints).\n"
-        "2) user_query: the actual academic question to be answered.\n"
-        'Return EXACT JSON: {"system_prompt": "...", "user_query": "..."}.\n'
-    )
-    model = "gemini-2.5-flash"
-    response = client.models.generate_content(
-        model=model,
-        contents=raw_text,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.0
-        )
-    )
-    txt = getattr(response, "text", None)
-    if not txt and getattr(response, "candidates", None):
-        c = response.candidates[0]
-        txt = getattr(c, "text", None) or getattr(c, "content", None)
-    return txt or ""
-
-
-def _parse_json_loose(raw: str) -> Dict:
-    raw = (raw or "").strip()
-    if not raw:
-        return {"system_prompt": "", "user_query": ""}
-    try:
-        return json.loads(raw)
-    except Exception:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1:
-            try:
-                return json.loads(raw[start:end + 1])
-            except Exception:
-                return {"system_prompt": "", "user_query": raw}
-        return {"system_prompt": "", "user_query": raw}
-
-
-def _call_gemini_store_selector_sync(client, stores: List[str], question: str) -> str:
-    """
-    Ask Gemini to pick which stores (subjects/chapters) are relevant for this student's question.
-    It can also split the question per store, and mark any parts that cannot be answered.
-    """
-    model = "gemini-2.5-flash"
-    system_prompt = f"""
-You are an academic router that reads a student's question and decides which study-material
-stores are relevant.
-
-Each store typically corresponds to a subject, semester, or carefully grouped notes.
-
-Available stores: {stores}
-
-The student question is: "{question}"
-
-You must:
-
-1. Identify which stores are relevant based on:
-   - chapter names (e.g., "Chapter 1", "Unit 2", "Module 3")
-   - subject names (e.g., "OS", "DBMS", "CN")
-   - hints like "according to class notes", "as per PPT", etc.
-
-2. If the question is broad (e.g., “Explain entire Unit 1” or “give all review question solutions for Chapter 1”),
-   select every store that might contain that chapter/unit.
-
-3. For each selected store, create a focused question that includes:
-   - the chapter/unit/module name (if mentioned)
-   - the student's intent (explain, summarize, list definitions, write short notes, solutions, etc.)
-
-Return VALID JSON in this EXACT structure:
-
-{{
-  "stores": ["store_name_1", "store_name_2"],
-  "split_questions": {{
-      "store_name_1": "focused question for this store",
-      "store_name_2": "another focused question"
-  }},
-  "unanswered": [
-      {{
-        "text": "any remaining part of the query that no store can handle",
-        "reason": "why it cannot be answered from given stores"
-      }}
-  ]
-}}
-
-If none of the stores match, return "stores": [] and in "unanswered" put the original question
-with a helpful reason.
-"""
-    response = client.models.generate_content(
-        model=model,
-        contents=question,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.0
-        )
-    )
-    txt = getattr(response, "text", None)
-    if not txt and getattr(response, "candidates", None):
-        c = response.candidates[0]
-        txt = getattr(c, "text", None) or getattr(c, "content", None)
-    return txt or ""
-
-
-async def _call_gemini_for_store_selection(
-    stores: List[str],
-    question: str,
-    sem_key: str
-) -> Dict:
-    if not stores:
-        return {"stores": [], "split_questions": {}, "unanswered": []}
-    if genai is None:
-        return {"stores": stores, "split_questions": {}, "unanswered": []}
-    loop = asyncio.get_running_loop()
-    try:
-        client = await loop.run_in_executor(None, init_gemini_client, sem_key)
-        raw = await loop.run_in_executor(
-            None,
-            _call_gemini_store_selector_sync,
-            client,
-            stores,
-            question
-        )
-        if not raw:
-            return {"stores": stores, "split_questions": {}, "unanswered": []}
-        parsed = _parse_json_loose(raw)
-        return {
-            "stores": parsed.get("stores", []) or [],
-            "split_questions": parsed.get("split_questions", {}) or {},
-            "unanswered": parsed.get("unanswered", []) or []
-        }
-    except Exception:
-        return {"stores": stores, "split_questions": {}, "unanswered": []}
-
-
-def data_store_name_for(local_store_name: str) -> str:
-    d = load_data()
-    return d.get("file_stores", {}).get(local_store_name, {}).get(
-        "file_search_store_name", ""
-    )
-
-
-async def _call_rag_for_store(
-    sem_key: str,
-    store: str,
-    question: str,
-    system_prompt: Optional[str] = None
-) -> Dict:
-    """
-    Core RAG call for one store.
-
-    For university students:
-    - Use File Search documents as *grounding* (to see syllabus, chapter names, question papers, etc.)
-    - BUT Gemini is REQUIRED to generate explanations and solutions even if the notes
-      only contain questions and not answers.
-    """
-    if genai is None:
-        return {"error": True, "detail": "Gemini SDK missing"}
-    loop = asyncio.get_running_loop()
-
-    def _sync_call():
-        client = init_gemini_client(sem_key)
-
-        # ---- STRONG ACADEMIC DEFAULT PROMPT (ALWAYS SOLVE) ----
-        cfg_prompt = system_prompt or (
-            "You are an academic assistant helping university students with notes, PPTs, "
-            "lesson plans, and review questions.\n"
-            "\n"
-            "You are given context from File Search which may include:\n"
-            "- Syllabus, chapter titles, unit names\n"
-            "- Question papers (like ESA / internal exams)\n"
-            "- Lesson plans, PPT outlines, handwritten notes, etc.\n"
-            "\n"
-            "IMPORTANT:\n"
-            "1. The retrieved documents might contain ONLY QUESTIONS and no solutions.\n"
-            "2. Even if the solutions are NOT present in the documents, you MUST still\n"
-            "   generate complete, correct solutions using your own reasoning and knowledge.\n"
-            "3. Treat the retrieved questions as the official exam questions and answer them\n"
-            "   fully, step-by-step, as if you are writing model answers for the exam.\n"
-            "4. Use the context mainly to understand the subject, chapter, unit, and style,\n"
-            "   but DO NOT restrict yourself to only what is explicitly written there.\n"
-            "\n"
-            "Answering rules:\n"
-            "- If the student asks for 'solutions', 'answers', 'ESA questions', 'model answers',\n"
-            "  consider that they want DETAILED solutions for all the exam questions you can see\n"
-            "  in the retrieved context.\n"
-            "- Write answers in clear, student-friendly language.\n"
-            "- Use headings, bullet points, and numbered steps where helpful.\n"
-            "- Prefer depth and clarity over being brief, since students will use this for exam preparation.\n"
-            "- NEVER reply that 'solutions are not available in the document'. If the question\n"
-            "  text is visible, that alone is enough for you to generate a solution.\n"
-            "- Only if the question itself is completely missing or unclear should you mention\n"
-            "  that you cannot answer a specific part.\n"
-            "\n"
-            "Do NOT mention File Search, embeddings, or internal implementation details.\n"
-        )
-
-        file_search_tool = types.Tool(
-            file_search=types.FileSearch(
-                file_search_store_names=[data_store_name_for(store)]
-            )
-        )
-
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=question,
-                config=types.GenerateContentConfig(
-                    system_instruction=cfg_prompt,
-                    tools=[file_search_tool],
-                    temperature=0.0
-                )
-            )
-            txt = getattr(response, "text", None)
-            if not txt and getattr(response, "candidates", None):
-                c = response.candidates[0]
-                txt = getattr(c, "text", None) or getattr(c, "content", None)
-            grounding = None
-            if hasattr(response, "candidates") and len(response.candidates) > 0:
-                grounding = getattr(response.candidates[0], "grounding_metadata", None)
-            return {
-                "store": store,
-                "question": question,
-                "answer": txt or "",
-                "grounding": grounding
-            }
-        except Exception as e:
-            return {
-                "store": store,
-                "question": question,
-                "answer": "",
-                "error": str(e)
-            }
-
-    return await loop.run_in_executor(None, _sync_call)
-
-
-
-def _merge_answers_apply_system(
-    sem_key: str,
-    system_prompt: str,
-    final_answers: List[Dict]
-) -> str:
-    """
-    Merge per-store answers into one final student-friendly answer.
-
-    We keep the same 'no Q/A storage' guarantee (merge happens in-memory only).
-    """
-    if not final_answers:
-        return ""
-    combined = []
-    for fa in final_answers:
-        s = fa.get("store")
-        q = fa.get("question")
-        a = fa.get("answer") or ""
-        combined.append(f"STORE: {s}\nQUESTION: {q}\nANSWER: {a}\n---")
-    combined_text = "\n".join(combined)
-
-    merge_instr = (
-    "You are an academic assistant combining answers from multiple study-material stores "
-    "into ONE final response for a student.\n"
-    "\n"
-    "System instructions for the final answer (from the user or application):\n"
-    f"{system_prompt}\n"
-    "\n"
-    "You are given answers from multiple stores below. Your job:\n"
-    "1. Merge them into a single coherent explanation.\n"
-    "2. Remove duplicates and contradictions.\n"
-    "3. Make the final answer well-structured and exam-friendly.\n"
-    "4. If the question involved 'review questions' or 'chapter solutions',\n"
-    "   ensure that all solutions are presented in an organized way (Q1, Q2, etc.).\n"
-    "5. If some minor detail is missing, you may mention it briefly, but you must still "
-    "   provide a best-effort complete solution using your own knowledge.\n"
-    "6. Do NOT mention stores, File Search, or internal implementation details.\n"
-    "\n"
-    "Return ONLY the final merged answer text, nothing else.\n"
-   )
-
-
-    try:
-        client = init_gemini_client(sem_key)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=combined_text,
-            config=types.GenerateContentConfig(
-                system_instruction=merge_instr,
-                temperature=0.0
-            )
-        )
-        txt = getattr(response, "text", None)
-        if not txt and getattr(response, "candidates", None):
-            c = response.candidates[0]
-            txt = getattr(c, "text", None) or getattr(c, "content", None)
-        return txt or ""
-    except Exception:
-        parts = []
-        for fa in final_answers:
-            parts.append(f"{fa.get('store')}: {fa.get('answer')}")
-        return "\n\n".join(parts)
-
 
 # =====================================================
-# ASK endpoint implementation (no session, no storing Q/A)
+# SIMPLE ASK endpoint implementation (NO prediction)
 # =====================================================
 
 @app.post("/departments/{department}/sems/{sem}/ask")
-async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
+def ask_department_sem(department: str, sem: str, payload: Dict[str, Any]):
     """
     Main endpoint students will call.
 
-    Body: { "question": "..." }
+    Body:
+    {
+      "question": "your question",
+      "stores": ["store1", "store2"],      # local store names under this sem
+      "system_prompt": "optional extra instructions"
+    }
 
-    Flow:
-    1. Extract (system_prompt, user_query) from the student's message.
-    2. Use Gemini to select which stores (subjects/chapters) are relevant.
-    3. Run RAG for each selected store.
-    4. If only one store and system_prompt exists, use that single RAG answer directly.
-    5. If multiple stores, merge answers and apply the system_prompt at final merge.
-    6. Return only final answer + minimal source texts (no Q/A stored).
+    Behaviour:
+    - Uses the sem's stored Gemini API key.
+    - Converts provided local store names into Gemini File Search store names.
+    - Calls Gemini ONCE with File Search tool across those stores.
+    - Returns final answer text + optional grounding metadata.
+    - NO system_prompt extraction. NO store prediction. NO per-store merging.
     """
+    if types is None:
+        raise HTTPException(
+            status_code=500,
+            detail="google-genai types not available on server."
+        )
+
     question = payload.get("question") if isinstance(payload, dict) else None
+    stores_from_body = payload.get("stores") if isinstance(payload, dict) else None
+    system_prompt = payload.get("system_prompt") if isinstance(payload, dict) else None
+
     if not question:
         raise HTTPException(status_code=400, detail="question required in request body")
+
+    if not stores_from_body or not isinstance(stores_from_body, list):
+        raise HTTPException(
+            status_code=400,
+            detail="stores (list of store names) is required in request body"
+        )
 
     data = load_data()
     if department not in data.get("departments", {}):
@@ -1376,135 +1086,74 @@ async def ask_department_sem(department: str, sem: str, payload: Dict[str, Any])
         raise HTTPException(status_code=404, detail="Sem not found")
 
     sem_meta = data["departments"][department]["sems"][sem]
-    stores = sem_meta.get("stores", [])
     sem_key = sem_meta.get("gemini_api_key")
     if not sem_key:
         raise HTTPException(status_code=500, detail="Sem Gemini API key missing")
 
-    # Step 1: extract system_prompt + user_query
-    system_prompt = ""
-    user_query = question
-    if genai is not None:
-        try:
-            loop = asyncio.get_running_loop()
-            client = await loop.run_in_executor(None, init_gemini_client, sem_key)
-            raw = await loop.run_in_executor(
-                None, _extract_system_and_query_sync, client, question
-            )
-            parsed = _parse_json_loose(raw)
-            system_prompt = parsed.get("system_prompt", "") or ""
-            user_query = parsed.get("user_query", "") or question
-        except Exception:
-            system_prompt = ""
-            user_query = question
+    # Convert local store names → Gemini File Search store resource names,
+    # but only if they belong to this sem.
+    valid_sem_stores = set(sem_meta.get("stores", []))
+    file_stores_meta = data.get("file_stores", {})
+    fs_store_names: List[str] = []
 
-    # Step 2: store selection
-    selector = await _call_gemini_for_store_selection(stores, user_query, sem_key)
-    selected_stores = selector.get("stores", []) or []
-    split_q = selector.get("split_questions", {}) or {}
-    unanswered_parts = selector.get("unanswered", []) or []
+    for s in stores_from_body:
+        if s in valid_sem_stores and s in file_stores_meta:
+            fs_name = file_stores_meta[s].get("file_search_store_name")
+            if fs_name:
+                fs_store_names.append(fs_name)
 
-    if not selected_stores:
-        resp_text = "Sorry, your question does not match any available study-material store."
-        if unanswered_parts:
-            extra = []
-            for part in unanswered_parts:
-                txt = part.get("text") or ""
-                reason = part.get("reason") or ""
-                if txt:
-                    extra.append(f'- "{txt}" ({reason})' if reason else f'- "{txt}"')
-            if extra:
-                resp_text += "\n\nDetails:\n" + "\n".join(extra)
-        return {
-            "success": True,
-            "response": resp_text,
-            "stores_used": [],
-            "sources": [],
-            "unanswered_parts": unanswered_parts
-        }
+    if not fs_store_names:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid File Search stores found for the provided store names under this sem."
+        )
 
-    # Step 3: per-store RAG calls
-    send_system_to_rag = len(selected_stores) == 1 and bool(system_prompt.strip())
-    tasks = []
-    for store in selected_stores:
-        q = split_q.get(store, user_query)
-        tasks.append(
-            asyncio.create_task(
-                _call_rag_for_store(
-                    sem_key,
-                    store,
-                    q,
-                    system_prompt if send_system_to_rag else None
-                )
+    # Default system prompt (if none provided)
+    system_instruction = system_prompt or (
+        "You are an academic assistant for university students. "
+        "Use ONLY the provided File Search documents to answer clearly, "
+        "with step-by-step, exam-focused explanations where needed."
+    )
+
+    try:
+        client = init_gemini_client(sem_key)
+
+        file_search_tool = types.Tool(
+            file_search=types.FileSearch(
+                file_search_store_names=fs_store_names
             )
         )
 
-    results = await asyncio.gather(*tasks)
-
-    final_answers = []
-    all_sources = []
-    for r in results:
-        if r.get("error"):
-            answer_text = "Sorry, I could not retrieve information from this store."
-            sources = []
-        else:
-            answer_text = r.get("answer", "")
-            grounding = r.get("grounding") or {}
-            chunks = grounding.get("groundingChunks", []) if isinstance(grounding, dict) else []
-            sources = []
-            for c in chunks:
-                ctx = c.get("retrievedContext", {})
-                if ctx.get("text"):
-                    # We only keep minimal text as 'source' for transparency;
-                    # still we do NOT store question/answer history anywhere.
-                    sources.append(ctx["text"])
-        final_answers.append({
-            "store": r.get("store"),
-            "question": r.get("question"),
-            "answer": answer_text,
-            "sources": sources
-        })
-        all_sources.extend(sources)
-
-    # Step 4: merge
-    if len(final_answers) == 1 and send_system_to_rag:
-        merged_text = final_answers[0]["answer"]
-    else:
-        if system_prompt.strip():
-            merged_text = _merge_answers_apply_system(sem_key, system_prompt, final_answers)
-        else:
-            # No explicit system prompt: just combine store answers plainly but still student-friendly.
-            parts = []
-            for fa in final_answers:
-                parts.append(f"**{fa['store']}**:\n{fa['answer']}")
-            merged_text = "\n\n".join(parts)
-
-    # If there were parts that no store could answer, append that info.
-    if unanswered_parts:
-        extra_lines = []
-        for part in unanswered_parts:
-            txt = part.get("text") or ""
-            reason = part.get("reason") or ""
-            if not txt:
-                continue
-            if reason:
-                extra_lines.append(f'- "{txt}" ({reason})')
-            else:
-                extra_lines.append(f'- "{txt}"')
-        if extra_lines:
-            merged_text += (
-                "\n\nThe following parts of your question could not be fully answered "
-                "from the available notes/stores:\n"
-                + "\n".join(extra_lines)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=question,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[file_search_tool],
+                temperature=0.2
             )
+        )
 
-    return {
-        "success": True,
-        "response": merged_text,
-        "stores_used": selected_stores,
-        "sources": all_sources[:1],  # keep just 1 minimal source snippet
-        "unanswered_parts": unanswered_parts
-    }
+        grounding = None
+        if hasattr(response, "candidates") and response.candidates:
+            grounding = getattr(response.candidates[0], "grounding_metadata", None)
+
+        answer_text = getattr(response, "text", "") or ""
+
+        return {
+            "success": True,
+            "response": answer_text,
+            "stores_used": stores_from_body,
+            "grounding_metadata": grounding
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gemini File Search RAG call failed: {e}"
+        )
 
 
 # ---------------- Run guidance ----------------
